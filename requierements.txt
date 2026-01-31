@@ -1,0 +1,7 @@
+pymupdf
+pillow
+opencv-python
+numpy
+tqdm
+rich
+pytesseract
