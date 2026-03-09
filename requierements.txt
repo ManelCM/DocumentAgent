@@ -1,7 +1,13 @@
 pymupdf
 pillow
 opencv-python
-numpy
+numpy<2
 tqdm
 rich
 pytesseract
+paddleocr
+torch
+transformers
+langgraph
+openai
+python-dotenv
