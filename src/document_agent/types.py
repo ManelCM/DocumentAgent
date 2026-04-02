@@ -12,6 +12,10 @@ class BlockType(str, Enum):
     CHART = "chart"
     FIGURE = "figure"
     CAPTION = "caption"
+    TABLE = "table"
+    HEADER = "header"   # page header / running head
+    FOOTER = "footer"   # page footer / footnote
+    MIXED = "mixed"     # inline math stitched with surrounding text
     OTHER = "other"
 
 
@@ -56,6 +60,10 @@ class DocumentBlock:
     child_ids: List[str] = field(default_factory=list)
     relations: Dict[str, Any] = field(default_factory=dict)
     payload: Dict[str, Any] = field(default_factory=dict)
+    # same-line group id for inline math (formula blocks on same line as text)
+    line_group_id: Optional[str] = None
+    # skip specialist dispatch (block absorbed into a MIXED parent)
+    skip_specialist: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -75,6 +83,7 @@ class DocumentBlock:
             "child_ids": self.child_ids,
             "relations": self.relations,
             "payload": self.payload,
+            "line_group_id": self.line_group_id,
         }
 
 
@@ -86,14 +95,18 @@ class AgentState(TypedDict, total=False):
     blocks: List[DocumentBlock]
     warnings: List[str]
     text_updates: Dict[str, Dict[str, Any]]
+    mixed_updates: Dict[str, Dict[str, Any]]
     image_updates: Dict[str, Dict[str, Any]]
     chart_updates: Dict[str, Dict[str, Any]]
     formula_updates: Dict[str, Dict[str, Any]]
+    table_updates: Dict[str, Dict[str, Any]]
     other_updates: Dict[str, Dict[str, Any]]
     text_warnings: List[str]
+    mixed_warnings: List[str]
     image_warnings: List[str]
     chart_warnings: List[str]
     formula_warnings: List[str]
+    table_warnings: List[str]
     other_warnings: List[str]
     output: Dict[str, Any]
     status: Literal["init", "running", "done", "error"]
