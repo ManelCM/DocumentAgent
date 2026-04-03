@@ -9,6 +9,9 @@ import pymupdf
 
 
 def _pixmap_to_bgr(pix: pymupdf.Pixmap) -> np.ndarray:
+    """
+    Convert a pymupdf.Pixmap to a BGR numpy array.
+    """
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
 
     if pix.n == 4:
@@ -20,6 +23,10 @@ def _pixmap_to_bgr(pix: pymupdf.Pixmap) -> np.ndarray:
 
 
 def load_document_pages(input_path: str, dpi: int = 200) -> Tuple[List[np.ndarray], List[Dict[str, int]]]:
+    """ 
+    Load pages from a document file. Supports PDFs (rendered to images) and image files. Returns a list of page images as numpy arrays and their sizes.
+    Each size dict contains: {"page_index": int, "width": int, "height": int}.
+    """
     path = Path(input_path)
     if not path.exists():
         raise FileNotFoundError(f"Input document not found: {path}")
