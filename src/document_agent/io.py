@@ -10,9 +10,13 @@ import pymupdf
 
 def _pixmap_to_bgr(pix: pymupdf.Pixmap) -> np.ndarray:
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+
     if pix.n == 4:
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    elif pix.n == 3:
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    else:
+        raise ValueError(f"Unsupported number of channels: {pix.n}")
 
 
 def load_document_pages(input_path: str, dpi: int = 200) -> Tuple[List[np.ndarray], List[Dict[str, int]]]:
