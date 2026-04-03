@@ -71,7 +71,7 @@ def build_graph():
         graph.add_edge("association_node", "aggregate")
         graph.add_edge("aggregate", END)
 
-        return graph.compile()
+        return graph
 
     except ModuleNotFoundError:
         # Fallback: run nodes sequentially without LangGraph
@@ -98,3 +98,6 @@ def build_graph():
                 return state
 
         return FallbackGraph()
+    
+def build_app():
+    return build_graph().compile()

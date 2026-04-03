@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .graph import build_graph
+from .graph import build_graph, build_app
 
 
 def parse_args():
@@ -24,7 +24,8 @@ def main():
 
     args = parse_args()
     app = build_graph()
-    result = app.invoke({"input_path": args.input, "status": "init"})
+    app2 = build_app()
+    result = app2.invoke({"input_path": args.input, "status": "init"})
     output = result.get("output", {})
 
     out_path = Path(args.output)
