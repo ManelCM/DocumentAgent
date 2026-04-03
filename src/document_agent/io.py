@@ -47,11 +47,11 @@ def load_document_pages(input_path: str, dpi: int = 200) -> Tuple[List[np.ndarra
         finally:
             doc.close()
     else:
-        img = cv2.imread(str(path))
+        img = cv2.imread(str(path)) # Read image file directly (supports various formats like PNG, JPEG, TIFF, etc.)
         if img is None:
             raise ValueError(f"Could not read image: {path}")
-        pages.append(img)
-        sizes.append({"page_index": 0, "width": int(img.shape[1]), "height": int(img.shape[0])})
+        pages.append(img) # Add to the list
+        sizes.append({"page_index": 0, "width": int(img.shape[1]), "height": int(img.shape[0])}) # Store page size info 
 
     return pages, sizes
 
