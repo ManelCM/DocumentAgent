@@ -1,3 +1,8 @@
+"""
+IO utilities for loading and saving document pages.
+
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
