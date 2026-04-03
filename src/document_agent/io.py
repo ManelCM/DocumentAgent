@@ -37,13 +37,13 @@ def load_document_pages(input_path: str, dpi: int = 200) -> Tuple[List[np.ndarra
     if path.suffix.lower() == ".pdf":
         doc = pymupdf.open(path)
         try:
-            zoom = dpi / 72.0
+            zoom = dpi / 72.0 # 72 DPI is the default resolution of PDF points. Resolution scaled for pdf rendering.    
             matrix = pymupdf.Matrix(zoom, zoom)
-            for i, page in enumerate(doc):
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                img = _pixmap_to_bgr(pix)
-                pages.append(img)
-                sizes.append({"page_index": i, "width": int(img.shape[1]), "height": int(img.shape[0])})
+            for i, page in enumerate(doc): 
+                pix = page.get_pixmap(matrix=matrix, alpha=False) # Render page to image at specified DPI, without alpha channel (take a photo from the page)
+                img = _pixmap_to_bgr(pix) # Convert to BGR format for OpenCV compatibility
+                pages.append(img)   # Add to the list
+                sizes.append({"page_index": i, "width": int(img.shape[1]), "height": int(img.shape[0])}) # Store page size info 
         finally:
             doc.close()
     else:
