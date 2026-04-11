@@ -90,7 +90,7 @@ def detect_layout_blocks(pages: List, warnings: List[str]) -> List[DocumentBlock
             block_num += 1
             blocks.append(
                 DocumentBlock(
-                    block_id=f"b{block_num}",
+                    block_id=f"p{page_idx}_b{block_num}",
                     page_index=page_idx,
                     bbox=BoundingBox(0, 0, page_w, page_h),
                     block_type=BlockType.TEXT,
