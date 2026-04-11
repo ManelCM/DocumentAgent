@@ -11,3 +11,5 @@ transformers
 langgraph
 openai
 python-dotenv
+# Reading order
+# microsoft/layoutreader is loaded via transformers — no extra package needed
