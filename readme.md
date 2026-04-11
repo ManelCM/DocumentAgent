@@ -1,87 +1,91 @@
-## DocumentAgent - OCR Multimodal con LangGraph
+# Exploring OCR Systems for Layout-Aware Document Understanding
 
-Pipeline estructural para documentos complejos:
+This project explores and compares different **OCR systems** (notably **Tesseract** and **PaddleOCR**) to understand their strengths, limitations, and failure modes, with the goal of designing a **robust, layout-aware document understanding pipeline**.
 
-1. Ingesta PDF/imagen.
-2. Deteccion de layouts.
-3. Clasificacion por tipo de bloque.
-4. Reading order.
-5. Jerarquia padre-hijo.
-6. Enrutamiento por nodos especializados.
-7. Salida JSON estructurada para downstream.
+Rather than relying on a single OCR model, the focus is on **analyzing how each system behaves**, what information it preserves or loses, and how their complementary capabilities can be combined into a stronger solution.
 
-### Estructura
+## 🎯 Motivation
 
-- `src/document_agent/graph.py`: grafo LangGraph.
-- `src/document_agent/nodes.py`: nodos de procesamiento.
-- `src/document_agent/layout.py`: mapeo de labels y deteccion.
-- `src/document_agent/order.py`: orden de lectura.
-- `src/document_agent/hierarchy.py`: relaciones jerarquicas.
-- `src/document_agent/cli.py`: ejecucion por linea de comandos.
+OCR systems are often treated as black boxes that simply “extract text”.  
+In practice, different OCR engines make **very different design trade-offs**:
 
-### Ejecucion
+- Some prioritize **readable plain text**
+- Others focus on **spatial localization and layout**
+- Some handle formulas or structured elements better than others
 
-```bash
-python -m document_agent --input "data/paper1.pdf" --output "outputs/paper1.json"
-```
+This project aims to:
+- understand **how OCR models fail**
+- identify **what each model does well**
+- leverage their strengths to build **a better downstream solution**
 
-Si usas el layout de carpetas actual:
 
-```bash
-cd DocumentAgent
-$env:PYTHONPATH="src"
-python -m document_agent --input "data/paper1.pdf" --output "outputs/paper1.json"
-```
+## 🔍 OCR Systems Explored
 
-### Entorno recomendado (aislado)
+### 1. Tesseract (Document-first OCR)
+- Produces a **linear text output** with implicit reading order.
+- Works well for:
+  - plain text extraction
+  - readable document reconstruction
+- Limitations:
+  - weak spatial grounding
+  - limited control over layout elements
+  - structured elements (tables, formulas) are hard to recover reliably
 
-PowerShell:
+### 2. PaddleOCR (Geometry-first OCR)
+- Detects **text regions with bounding boxes and layout information**.
+- Excels at:
+  - layout detection
+  - spatial localization
+  - identifying figures, tables, formulas as regions
+- Limitations:
+  - no guaranteed reading order
+  - poor semantic understanding of formulas, charts, and tables
+  - outputs independent text regions rather than a document stream
 
-```powershell
-cd DocumentAgent
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
 
-### OpenAI API (VLM)
+## 🧠 Key Idea: Learn from Failures, Combine Strengths
 
-Configura tu clave en variables de entorno o con `.env`:
+Instead of choosing one OCR system, the project studies:
+- where Tesseract succeeds and fails
+- where PaddleOCR succeeds and fails
+- how their outputs can complement each other
 
-```powershell
-cd DocumentAgent
-Copy-Item .env.example .env
-```
+This leads to a **hybrid perspective**:
+- Tesseract → good for *what the text says*
+- PaddleOCR → good for *where the text is*
 
-Variables:
 
-- `OPENAI_API_KEY`: clave de OpenAI.
-- `OPENAI_VLM_IMAGE_MODEL`: modelo para `image_node`.
-- `OPENAI_VLM_CHART_MODEL`: modelo para `chart_node`.
-- `OPENAI_VLM_FORMULA_MODEL`: modelo para `formula_node`.
+## 🧩 Layout-Aware Processing
 
-Prompts actuales:
+Using layout detection (from PaddleOCR), documents are decomposed into:
+- text blocks
+- headings
+- tables
+- figures / charts
+- mathematical formulas
 
-- `image_node`: descripcion objetiva de la figura y texto visible en formato JSON.
-- `chart_node`: tipo de grafica, ejes, tendencias, extremos y takeaway en JSON.
-- `formula_node`: extraccion a LaTeX y significado breve en JSON.
+Each region is associated with a bounding box, enabling:
+- reading order reconstruction
+- region-wise processing
+- targeted use of specialized tools
 
-### Nodos especializados
 
-- `text_node`: OCR de regiones de texto.
-- `image_node`: descripcion VLM con OpenAI (con fallback).
-- `chart_node`: interpretacion semantica con OpenAI (con fallback).
-- `formula_node`: extraccion/formato matematico con OpenAI (con fallback).
-- `association_node`: vinculacion figura-caption.
+## 🤖 Agent-Based Document Understanding
 
-### Salida
+An **AI Agent** can orchestrate the pipeline by:
+- inspecting detected layout regions
+- deciding how each region should be processed
+- routing regions to specialized tools:
+  - text → LLMs
+  - tables → table parsers
+  - charts → image / chart understanding models
+  - formulas → math-aware OCR or symbolic parsers
 
-JSON con:
+This agent-based approach allows the system to:
+- exploit the strengths of different OCR models
+- mitigate their individual weaknesses
+- build a flexible, extensible document understanding pipeline
 
-- bloques ordenados por lectura.
-- tipo de bloque.
-- bbox.
-- jerarquia (`parent_id`, `child_ids`).
-- relaciones semanticas (`relations`).
-- payload por nodo especialista.
+
+
+
