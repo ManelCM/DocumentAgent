@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
@@ -12,6 +14,7 @@ from .hierarchy import build_hierarchy
 from .io import load_document_pages
 from .layout import detect_layout_blocks
 from .order import apply_reading_order
+from .tracer import finish_trace, init_trace, node_end, node_start, record_block
 from .types import AgentState, BlockType, DocumentBlock
 from .vlm_openai import (
     analyze_chart,
@@ -22,15 +25,22 @@ from .vlm_openai import (
     load_vlm_config,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Document loading
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_load_document(state: AgentState) -> AgentState:
+    trace = init_trace()
+    entry = node_start(trace, "load_document")
     run_id = state.get("run_id") or str(uuid.uuid4())
     warnings = list(state.get("warnings", []))
+    logger.info("[load_document] loading %s", state["input_path"])
     pages, sizes = load_document_pages(state["input_path"])
+    node_end(entry)
+    logger.info("[load_document] %d pages loaded in %.2fs", len(pages), entry["duration_s"])
     return {
         **state,
         "run_id": run_id,
@@ -38,6 +48,7 @@ def node_load_document(state: AgentState) -> AgentState:
         "page_sizes": sizes,
         "warnings": warnings,
         "status": "running",
+        "_trace": trace,
     }
 
 
@@ -46,9 +57,13 @@ def node_load_document(state: AgentState) -> AgentState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_detect_layout(state: AgentState) -> AgentState:
+    trace = state.get("_trace", init_trace())
+    entry = node_start(trace, "detect_layout")
     warnings = list(state.get("warnings", []))
     blocks = detect_layout_blocks(state["pages"], warnings)
-    return {**state, "blocks": blocks, "warnings": warnings}
+    node_end(entry)
+    logger.info("[detect_layout] %d blocks detected in %.2fs", len(blocks), entry["duration_s"])
+    return {**state, "blocks": blocks, "warnings": warnings, "_trace": trace}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -56,8 +71,12 @@ def node_detect_layout(state: AgentState) -> AgentState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_reading_order(state: AgentState) -> AgentState:
+    trace = state.get("_trace", init_trace())
+    entry = node_start(trace, "reading_order")
     blocks = apply_reading_order(state.get("blocks", []), state.get("page_sizes"))
-    return {**state, "blocks": blocks}
+    node_end(entry)
+    logger.info("[reading_order] order assigned in %.2fs", entry["duration_s"])
+    return {**state, "blocks": blocks, "_trace": trace}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,8 +84,13 @@ def node_reading_order(state: AgentState) -> AgentState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_hierarchy(state: AgentState) -> AgentState:
+    trace = state.get("_trace", init_trace())
+    entry = node_start(trace, "hierarchy")
     blocks = build_hierarchy(state.get("blocks", []))
-    return {**state, "blocks": blocks}
+    node_end(entry)
+    mixed = sum(1 for b in blocks if b.block_type == BlockType.MIXED)
+    logger.info("[hierarchy] done in %.2fs — %d MIXED blocks stitched", entry["duration_s"], mixed)
+    return {**state, "blocks": blocks, "_trace": trace}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -138,6 +162,7 @@ def _extract_text_paddle(crop) -> Dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _process_block_task(task: Dict) -> Dict:
+    t0 = time.time()
     block: DocumentBlock = task["block"]
     crop = task["crop"]
     cfg = task["cfg"]
@@ -240,7 +265,24 @@ def _process_block_task(task: Dict) -> Dict:
                 }
                 warnings.append(f"table_node fallback for {block.block_id}: {exc}")
 
-    return {"block_id": block.block_id, "payload": payload, "warnings": warnings}
+    duration = time.time() - t0
+    engine = (
+        payload.get("ocr_engine")
+        or payload.get("vlm_engine")
+        or payload.get("formula_engine")
+        or payload.get("chart_engine")
+        or payload.get("table_engine")
+        or "unknown"
+    )
+    logger.debug("[%s] %s %s engine=%s t=%.3fs", kind, block.block_id, block.block_type.value, engine, duration)
+    return {
+        "block_id": block.block_id,
+        "payload": payload,
+        "warnings": warnings,
+        "_duration": duration,
+        "_engine": engine,
+        "_kind": kind,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -260,8 +302,10 @@ _KIND_TO_TYPES: Dict[str, set] = {
 
 def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]:
     blocks = state.get("blocks", [])
+    trace = state.get("_trace") or {}
     cfg = load_vlm_config()
     target_types = _KIND_TO_TYPES.get(kind, set())
+    block_map = {b.block_id: b for b in blocks}
     tasks = []
 
     for block in blocks:
@@ -283,8 +327,19 @@ def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]
         futures = [ex.submit(_process_block_task, t) for t in tasks]
         for fut in as_completed(futures):
             result = fut.result()
-            updates[result["block_id"]] = result["payload"]
+            bid = result["block_id"]
+            updates[bid] = result["payload"]
             warnings.extend(result["warnings"])
+            # Record block event in trace
+            if bid in block_map:
+                record_block(
+                    trace,
+                    block_map[bid],
+                    specialist=result.get("_kind", kind),
+                    engine=result.get("_engine", "unknown"),
+                    duration_s=result.get("_duration", 0.0),
+                    payload=result["payload"],
+                )
 
     return updates, warnings
 
@@ -294,39 +349,65 @@ def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_text_specialist(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "text_specialist")
     updates, warns = _run_specialist_kind(state, "text")
+    node_end(entry)
+    logger.info("[text_specialist] %d blocks in %.2fs", len(updates), entry["duration_s"])
     return {"text_updates": updates, "text_warnings": warns}
 
 
 def node_mixed_specialist(state: AgentState) -> AgentState:
-    # MIXED blocks use their own keys to avoid collision with text_specialist
-    # in the parallel fan-out. node_reduce_specialists merges them together.
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "mixed_specialist")
     updates, warns = _run_specialist_kind(state, "mixed")
+    node_end(entry)
+    logger.info("[mixed_specialist] %d blocks in %.2fs", len(updates), entry["duration_s"])
     return {"mixed_updates": updates, "mixed_warnings": warns}
 
 
 def node_image_specialist(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "image_specialist")
     updates, warns = _run_specialist_kind(state, "image")
+    node_end(entry)
+    logger.info("[image_specialist] %d blocks in %.2fs", len(updates), entry["duration_s"])
     return {"image_updates": updates, "image_warnings": warns}
 
 
 def node_chart_specialist(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "chart_specialist")
     updates, warns = _run_specialist_kind(state, "chart")
+    node_end(entry)
+    logger.info("[chart_specialist] %d blocks in %.2fs", len(updates), entry["duration_s"])
     return {"chart_updates": updates, "chart_warnings": warns}
 
 
 def node_formula_specialist(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "formula_specialist")
     updates, warns = _run_specialist_kind(state, "formula")
+    node_end(entry)
+    logger.info("[formula_specialist] %d blocks in %.2fs", len(updates), entry["duration_s"])
     return {"formula_updates": updates, "formula_warnings": warns}
 
 
 def node_table_specialist(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "table_specialist")
     updates, warns = _run_specialist_kind(state, "table")
+    node_end(entry)
+    logger.info("[table_specialist] %d blocks in %.2fs", len(updates), entry["duration_s"])
     return {"table_updates": updates, "table_warnings": warns}
 
 
 def node_other_specialist(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "other_specialist")
     updates, warns = _run_specialist_kind(state, "other")
+    node_end(entry)
+    logger.info("[other_specialist] %d blocks in %.2fs", len(updates), entry["duration_s"])
     return {"other_updates": updates, "other_warnings": warns}
 
 
@@ -335,6 +416,8 @@ def node_other_specialist(state: AgentState) -> AgentState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_reduce_specialists(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "reduce_specialists")
     blocks = state.get("blocks", [])
     by_id = {b.block_id: b for b in blocks}
     warnings = list(state.get("warnings", []))
@@ -355,7 +438,10 @@ def node_reduce_specialists(state: AgentState) -> AgentState:
     for key in warn_keys:
         warnings.extend(state.get(key, []) or [])
 
-    return {**state, "blocks": blocks, "warnings": warnings}
+    node_end(entry)
+    logger.info("[reduce_specialists] merged in %.2fs — %d warnings total",
+                entry["duration_s"], len(warnings))
+    return {**state, "blocks": blocks, "warnings": warnings, "_trace": trace}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -373,11 +459,11 @@ _XREF_PATTERNS = [
 
 
 def node_cross_reference(state: AgentState) -> AgentState:
-    """
-    Scan text block payloads for references to figures, tables, equations, and citations.
-    Store found references in block.relations["references"].
-    """
+    """Scan text payloads for references to figures, tables, equations, citations."""
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "cross_reference")
     blocks = state.get("blocks", [])
+    total_refs = 0
 
     for block in blocks:
         if block.block_type not in {BlockType.TEXT, BlockType.MIXED}:
@@ -393,8 +479,11 @@ def node_cross_reference(state: AgentState) -> AgentState:
 
         if refs:
             block.relations["references"] = refs
+            total_refs += len(refs)
 
-    return {**state, "blocks": blocks}
+    node_end(entry)
+    logger.info("[cross_reference] %d references found in %.2fs", total_refs, entry["duration_s"])
+    return {**state, "blocks": blocks, "_trace": trace}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -402,6 +491,8 @@ def node_cross_reference(state: AgentState) -> AgentState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_association(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "association")
     blocks = state.get("blocks", [])
     captions = [b for b in blocks if b.block_type == BlockType.CAPTION]
     figure_like = [b for b in blocks if b.block_type in {BlockType.FIGURE, BlockType.IMAGE, BlockType.CHART, BlockType.TABLE}]
@@ -442,7 +533,9 @@ def node_association(state: AgentState) -> AgentState:
                 parent.relations.setdefault("embedded_formulas", []).append(formula.block_id)
                 formula.relations["embedded_in"] = parent.block_id
 
-    return {**state, "blocks": blocks}
+    node_end(entry)
+    logger.info("[association] linked %d captions in %.2fs", len(captions), entry["duration_s"])
+    return {**state, "blocks": blocks, "_trace": trace}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -450,6 +543,8 @@ def node_association(state: AgentState) -> AgentState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def node_aggregate(state: AgentState) -> AgentState:
+    trace = state.get("_trace") or {}
+    entry = node_start(trace, "aggregate")
     blocks = state.get("blocks", [])
     ordered = sorted(
         blocks,
@@ -458,6 +553,11 @@ def node_aggregate(state: AgentState) -> AgentState:
     type_counts: Dict[str, int] = {}
     for b in ordered:
         type_counts[b.block_type.value] = type_counts.get(b.block_type.value, 0) + 1
+
+    node_end(entry)
+    finish_trace(trace)
+    logger.info("[aggregate] done — %d blocks, total pipeline %.2fs",
+                len(ordered), trace.get("total_duration_s", 0))
 
     output: Dict = {
         "run_id": state.get("run_id"),
@@ -472,4 +572,4 @@ def node_aggregate(state: AgentState) -> AgentState:
             "types": type_counts,
         },
     }
-    return {**state, "output": output, "status": "done"}
+    return {**state, "output": output, "status": "done", "_trace": trace}

@@ -110,3 +110,4 @@ class AgentState(TypedDict, total=False):
     other_warnings: List[str]
     output: Dict[str, Any]
     status: Literal["init", "running", "done", "error"]
+    _trace: Dict[str, Any]   # pipeline tracer — timing + block events
