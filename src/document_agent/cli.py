@@ -9,8 +9,9 @@ from pathlib import Path
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    fmt = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
-    logging.basicConfig(stream=sys.stdout, level=level, format=fmt, datefmt="%H:%M:%S")
+    fmt = "%(asctime)s %(levelname)-8s %(name)s - %(message)s"
+    stream = open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1, closefd=False)
+    logging.basicConfig(stream=stream, level=level, format=fmt, datefmt="%H:%M:%S")
     # Silence noisy third-party loggers
     for noisy in ("ppocr", "paddle", "PIL", "urllib3", "httpx", "openai", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -27,6 +28,13 @@ def parse_args():
 
 
 def main():
+    # Must be set before any native library (PaddleOCR + LayoutDetection both use OpenMP;
+    # concurrent initialisation without this causes a segfault on Windows).
+    import os
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+
     try:
         from dotenv import load_dotenv
         load_dotenv()
@@ -39,6 +47,17 @@ def main():
 
     from .graph import build_graph
     app = build_graph().compile()
+
+    # Pre-warm PaddleOCR NOW — in the main thread, before LangGraph's executor
+    # starts its background threads.  PaddleOCR v3's oneDNN/TBB backend crashes
+    # when initialised concurrently with other threads.
+    log.info("Pre-warming PaddleOCR OCR engine (first-time model load)...")
+    from .nodes import _get_paddle_ocr
+    ocr = _get_paddle_ocr()
+    if ocr is None:
+        log.warning("PaddleOCR unavailable — text blocks will use Tesseract fallback")
+    else:
+        log.info("PaddleOCR ready")
 
     log.info("Starting OCR pipeline on: %s", args.input)
     result = app.invoke({"input_path": args.input, "status": "init"})

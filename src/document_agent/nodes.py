@@ -39,6 +39,7 @@ def node_load_document(state: AgentState) -> AgentState:
     warnings = list(state.get("warnings", []))
     logger.info("[load_document] loading %s", state["input_path"])
     pages, sizes = load_document_pages(state["input_path"])
+
     node_end(entry)
     logger.info("[load_document] %d pages loaded in %.2fs", len(pages), entry["duration_s"])
     return {
@@ -89,7 +90,7 @@ def node_hierarchy(state: AgentState) -> AgentState:
     blocks = build_hierarchy(state.get("blocks", []))
     node_end(entry)
     mixed = sum(1 for b in blocks if b.block_type == BlockType.MIXED)
-    logger.info("[hierarchy] done in %.2fs — %d MIXED blocks stitched", entry["duration_s"], mixed)
+    logger.info("[hierarchy] done in %.2fs - %d MIXED blocks stitched", entry["duration_s"], mixed)
     return {**state, "blocks": blocks, "_trace": trace}
 
 
@@ -108,20 +109,37 @@ def _crop_block_image(state: AgentState, block_id: str):
 # PaddleOCR text extraction (replaces Tesseract)
 # ──────────────────────────────────────────────────────────────────────────────
 
+import threading as _threading
+
 _PADDLE_OCR = None
 _PADDLE_OCR_LOADED = False
+_PADDLE_OCR_LOCK = _threading.Lock()
 
 
 def _get_paddle_ocr():
+    """Return the shared PaddleOCR instance, initialising it once (thread-safe).
+
+    PaddleOCR v3's C++ inference backend crashes if initialised while other
+    threads are concurrently active (the specialist fan-out stage).  Always
+    call this from the main thread in node_load_document to pre-warm the
+    model before any parallel processing begins.
+    """
     global _PADDLE_OCR, _PADDLE_OCR_LOADED
     if _PADDLE_OCR_LOADED:
         return _PADDLE_OCR
-    _PADDLE_OCR_LOADED = True
-    try:
-        from paddleocr import PaddleOCR
-        _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-    except Exception:
-        _PADDLE_OCR = None
+    with _PADDLE_OCR_LOCK:
+        if _PADDLE_OCR_LOADED:   # double-checked locking
+            return _PADDLE_OCR
+        _PADDLE_OCR_LOADED = True
+        try:
+            from paddleocr import PaddleOCR
+            try:
+                _PADDLE_OCR = PaddleOCR(lang="en")
+            except TypeError:
+                # PaddleOCR <3.0 API
+                _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+        except Exception:
+            _PADDLE_OCR = None
     return _PADDLE_OCR
 
 
@@ -137,10 +155,13 @@ def _extract_text_paddle(crop) -> Dict:
             lines = []
             if result:
                 for page_result in result:
-                    # New API returns objects/dicts with rec_texts
-                    if hasattr(page_result, "rec_texts"):
+                    # PaddleOCR v3 returns a list of dicts with 'rec_texts' key
+                    if isinstance(page_result, dict) and "rec_texts" in page_result:
+                        lines.extend(page_result["rec_texts"])
+                    elif hasattr(page_result, "rec_texts"):
                         lines.extend(page_result.rec_texts)
                     elif isinstance(page_result, list):
+                        # Old PaddleOCR v2 format: [[bbox, (text, score)], ...]
                         for line in page_result:
                             if line and len(line) >= 2 and line[1]:
                                 lines.append(line[1][0])
@@ -174,7 +195,7 @@ def _process_block_task(task: Dict) -> Dict:
         payload = _extract_text_paddle(crop)
 
     elif kind == "mixed":
-        # Inline math + surrounding text — send merged crop to VLM
+        # Inline math + surrounding text - send merged crop to VLM
         if crop is None or not crop.size:
             payload = {"full_text": "", "formula_latex": "", "plain_text": "", "vlm_engine": "openai"}
         else:
@@ -242,7 +263,7 @@ def _process_block_task(task: Dict) -> Dict:
             warnings.append(f"formula_node fallback for {block.block_id}: {exc}")
 
     elif kind == "other":
-        # Unknown block type — run OCR so the payload is never empty.
+        # Unknown block type - run OCR so the payload is never empty.
         payload = _extract_text_paddle(crop)
 
     elif kind == "table":
@@ -439,7 +460,7 @@ def node_reduce_specialists(state: AgentState) -> AgentState:
         warnings.extend(state.get(key, []) or [])
 
     node_end(entry)
-    logger.info("[reduce_specialists] merged in %.2fs — %d warnings total",
+    logger.info("[reduce_specialists] merged in %.2fs - %d warnings total",
                 entry["duration_s"], len(warnings))
     return {**state, "blocks": blocks, "warnings": warnings, "_trace": trace}
 
@@ -556,7 +577,7 @@ def node_aggregate(state: AgentState) -> AgentState:
 
     node_end(entry)
     finish_trace(trace)
-    logger.info("[aggregate] done — %d blocks, total pipeline %.2fs",
+    logger.info("[aggregate] done - %d blocks, total pipeline %.2fs",
                 len(ordered), trace.get("total_duration_s", 0))
 
     output: Dict = {

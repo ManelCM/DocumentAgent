@@ -73,6 +73,14 @@ def map_detector_label(label: str) -> BlockType:
 
 
 def detect_layout_blocks(pages: List, warnings: List[str]) -> List[DocumentBlock]:
+    """Detect layout blocks using PaddleOCR LayoutDetection (in-process).
+
+    Note: LayoutDetection and PaddleOCR OCR both use PaddlePaddle's oneDNN
+    backend.  Running LayoutDetection first "warms up" the runtime so that
+    PaddleOCR can initialise on top of it without crashing.  OMP_NUM_THREADS=1
+    (set by the re-exec guard in __main__.py) prevents the threading conflict
+    between their respective inference engines.
+    """
     blocks: List[DocumentBlock] = []
     block_num = 0
 
