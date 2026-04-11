@@ -14,7 +14,8 @@ from .hierarchy import build_hierarchy
 from .io import load_document_pages
 from .layout import detect_layout_blocks
 from .order import apply_reading_order
-from .tracer import finish_trace, init_trace, node_end, node_start, record_block
+from .tracer import finish_trace, init_trace, node_end, node_start, record_block, record_llm_call
+from .vlm_openai import PROMPT_REGISTRY
 from .types import AgentState, BlockType, DocumentBlock
 from .vlm_openai import (
     analyze_chart,
@@ -117,29 +118,19 @@ _PADDLE_OCR_LOCK = _threading.Lock()
 
 
 def _get_paddle_ocr():
-    """Return the shared PaddleOCR instance, initialising it once (thread-safe).
-
-    PaddleOCR v3's C++ inference backend crashes if initialised while other
-    threads are concurrently active (the specialist fan-out stage).  Always
-    call this from the main thread in node_load_document to pre-warm the
-    model before any parallel processing begins.
+    """PaddleOCR v3 PP-OCRv5 server models conflict with LayoutDetection in-process
+    on Windows (PaddlePaddle oneDNN/TBB backend crashes with SIGSEGV when both sets
+    of models are loaded in the same process).  Text blocks use pytesseract instead,
+    which gives excellent quality for clean academic/document text.
     """
     global _PADDLE_OCR, _PADDLE_OCR_LOADED
     if _PADDLE_OCR_LOADED:
         return _PADDLE_OCR
     with _PADDLE_OCR_LOCK:
-        if _PADDLE_OCR_LOADED:   # double-checked locking
+        if _PADDLE_OCR_LOADED:
             return _PADDLE_OCR
         _PADDLE_OCR_LOADED = True
-        try:
-            from paddleocr import PaddleOCR
-            try:
-                _PADDLE_OCR = PaddleOCR(lang="en")
-            except TypeError:
-                # PaddleOCR <3.0 API
-                _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-        except Exception:
-            _PADDLE_OCR = None
+        _PADDLE_OCR = None  # Always use pytesseract fallback
     return _PADDLE_OCR
 
 
@@ -169,11 +160,11 @@ def _extract_text_paddle(crop) -> Dict:
         except Exception:
             pass  # fall through to Tesseract
 
-    # Tesseract fallback
+    # Tesseract (primary text engine — PaddleOCR intentionally disabled)
     try:
         import pytesseract
         text = pytesseract.image_to_string(crop)
-        return {"text": text.strip(), "ocr_engine": "pytesseract_fallback"}
+        return {"text": text.strip(), "ocr_engine": "pytesseract"}
     except Exception as exc:
         return {"text": "", "ocr_engine": "fallback", "ocr_error": str(exc)}
 
@@ -183,108 +174,167 @@ def _extract_text_paddle(crop) -> Dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _process_block_task(task: Dict) -> Dict:
+    """Process one block.  Returns payload + full LLM audit trail."""
     t0 = time.time()
     block: DocumentBlock = task["block"]
-    crop = task["crop"]
-    cfg = task["cfg"]
+    crop   = task["crop"]
+    cfg    = task["cfg"]
     kind: str = task["kind"]
-    payload = {}
+    payload: Dict = {}
     warnings: List[str] = []
+    # Buffered LLM call records — written to trace in main thread after return
+    llm_calls: List[Dict] = []
+
+    import json as _json
+
+    def _parse_vlm(raw: str, defaults: Dict) -> Dict:
+        """Parse the VLM JSON response into a flat dict; fall back to defaults."""
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return defaults
 
     if kind == "text":
         payload = _extract_text_paddle(crop)
 
     elif kind == "mixed":
-        # Inline math + surrounding text - send merged crop to VLM
         if crop is None or not crop.size:
             payload = {"full_text": "", "formula_latex": "", "plain_text": "", "vlm_engine": "openai"}
         else:
             try:
-                text, model_name = analyze_mixed(crop, cfg)
-                payload = {"full_text": text, "vlm_engine": "openai", "vlm_model": model_name}
-            except Exception as exc:
-                # Fallback: OCR the merged crop
-                ocr_result = _extract_text_paddle(crop)
+                t_call = time.time()
+                text, model_name, usage, prompt_name = analyze_mixed(crop, cfg)
+                call_dur = time.time() - t_call
+                parsed = _parse_vlm(text, {"full_text": text, "formula_latex": "", "plain_text": ""})
                 payload = {
-                    "full_text": ocr_result.get("text", ""),
-                    "vlm_engine": "fallback",
-                    "vlm_model": "",
+                    "full_text":     parsed.get("full_text", text),
+                    "formula_latex": parsed.get("formula_latex", ""),
+                    "plain_text":    parsed.get("plain_text", ""),
+                    "confidence":    parsed.get("confidence", 0.0),
+                    "vlm_engine":    "openai",
+                    "vlm_model":     model_name,
+                    "_raw_response": text,
                 }
-                warnings.append(f"mixed_node fallback for {block.block_id}: {exc}")
+                llm_calls.append({"model": model_name, "prompt_name": prompt_name,
+                                   "response_text": text, "usage": usage, "duration_s": call_dur})
+            except Exception as exc:
+                ocr_result = _extract_text_paddle(crop)
+                payload = {"full_text": ocr_result.get("text", ""), "vlm_engine": "fallback", "vlm_model": ""}
+                warnings.append(f"mixed fallback for {block.block_id}: {exc}")
 
     elif kind == "image":
         h, w = (crop.shape[:2] if crop is not None and crop.size else (0, 0))
         if crop is None or not crop.size:
-            payload = {"description": "", "vlm_engine": "openai", "vlm_model": cfg.image_model}
+            payload = {"summary": "", "vlm_engine": "openai", "vlm_model": cfg.image_model}
         else:
             try:
-                text, model_name = analyze_image(crop, cfg)
-                payload = {"description": text, "vlm_engine": "openai", "vlm_model": model_name}
-            except Exception as exc:
+                t_call = time.time()
+                text, model_name, usage, prompt_name = analyze_image(crop, cfg)
+                call_dur = time.time() - t_call
+                parsed = _parse_vlm(text, {"summary": text})
                 payload = {
-                    "description": f"Image region {w}x{h}. OpenAI VLM unavailable.",
-                    "vlm_engine": "fallback",
-                    "vlm_model": "",
+                    "summary":       parsed.get("summary", text),
+                    "key_elements":  parsed.get("key_elements", []),
+                    "visible_text":  parsed.get("visible_text", ""),
+                    "spatial_layout": parsed.get("spatial_layout", ""),
+                    "confidence":    parsed.get("confidence", 0.0),
+                    "vlm_engine":    "openai",
+                    "vlm_model":     model_name,
+                    "_raw_response": text,
                 }
-                warnings.append(f"image_node fallback for {block.block_id}: {exc}")
+                llm_calls.append({"model": model_name, "prompt_name": prompt_name,
+                                   "response_text": text, "usage": usage, "duration_s": call_dur})
+            except Exception as exc:
+                payload = {"summary": f"Image region {w}×{h}. VLM unavailable.", "vlm_engine": "fallback", "vlm_model": ""}
+                warnings.append(f"image fallback for {block.block_id}: {exc}")
 
     elif kind == "chart":
         if crop is None or not crop.size:
-            payload = {"chart_semantics": {"status": "empty_crop"}, "chart_engine": "openai"}
+            payload = {"takeaway": "", "chart_engine": "openai"}
         else:
             try:
-                text, model_name = analyze_chart(crop, cfg)
+                t_call = time.time()
+                text, model_name, usage, prompt_name = analyze_chart(crop, cfg)
+                call_dur = time.time() - t_call
+                parsed = _parse_vlm(text, {"takeaway": text})
                 payload = {
-                    "chart_semantics": {"status": "ok", "data": text},
+                    "chart_type": parsed.get("chart_type", ""),
+                    "title":      parsed.get("title", ""),
+                    "axes":       parsed.get("axes", {}),
+                    "series":     parsed.get("series", []),
+                    "trends":     parsed.get("trends", ""),
+                    "extrema":    parsed.get("extrema", {}),
+                    "comparisons": parsed.get("comparisons", ""),
+                    "data_table": parsed.get("data_table", ""),
+                    "takeaway":   parsed.get("takeaway", ""),
+                    "confidence": parsed.get("confidence", 0.0),
                     "chart_engine": "openai",
-                    "chart_model": model_name,
+                    "chart_model":  model_name,
+                    "_raw_response": text,
                 }
+                llm_calls.append({"model": model_name, "prompt_name": prompt_name,
+                                   "response_text": text, "usage": usage, "duration_s": call_dur})
             except Exception as exc:
-                payload = {"chart_semantics": {"status": "fallback"}, "chart_engine": "fallback"}
-                warnings.append(f"chart_node fallback for {block.block_id}: {exc}")
+                payload = {"takeaway": "", "chart_engine": "fallback"}
+                warnings.append(f"chart fallback for {block.block_id}: {exc}")
 
     elif kind == "formula":
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop is not None and crop.size else crop
-        try:
-            text, model_name = analyze_formula(crop, cfg)
-            payload = {
-                "formula_latex": text,
-                "formula_engine": "openai",
-                "formula_model": model_name,
-                "preprocess": {"shape": tuple(gray.shape) if gray is not None else (0, 0)},
-            }
-        except Exception as exc:
-            payload = {
-                "formula_latex": "",
-                "formula_engine": "fallback",
-                "formula_model": "",
-                "preprocess": {"shape": tuple(gray.shape) if gray is not None else (0, 0)},
-            }
-            warnings.append(f"formula_node fallback for {block.block_id}: {exc}")
+        if crop is None or not crop.size:
+            payload = {"latex": "", "formula_engine": "openai"}
+        else:
+            try:
+                t_call = time.time()
+                text, model_name, usage, prompt_name = analyze_formula(crop, cfg)
+                call_dur = time.time() - t_call
+                parsed = _parse_vlm(text, {"latex": text})
+                payload = {
+                    "latex":        parsed.get("latex", text),
+                    "symbols":      parsed.get("symbols", []),
+                    "formula_type": parsed.get("formula_type", ""),
+                    "meaning":      parsed.get("meaning", ""),
+                    "confidence":   parsed.get("confidence", 0.0),
+                    "formula_engine": "openai",
+                    "formula_model":  model_name,
+                    "_raw_response":  text,
+                }
+                llm_calls.append({"model": model_name, "prompt_name": prompt_name,
+                                   "response_text": text, "usage": usage, "duration_s": call_dur})
+            except Exception as exc:
+                payload = {"latex": "", "formula_engine": "fallback", "formula_model": ""}
+                warnings.append(f"formula fallback for {block.block_id}: {exc}")
 
     elif kind == "other":
-        # Unknown block type - run OCR so the payload is never empty.
         payload = _extract_text_paddle(crop)
 
     elif kind == "table":
         if crop is None or not crop.size:
-            payload = {"table_data": {"status": "empty_crop"}, "table_engine": "openai"}
+            payload = {"summary": "", "headers": [], "rows": [], "table_engine": "openai"}
         else:
             try:
-                text, model_name = analyze_table(crop, cfg)
+                t_call = time.time()
+                text, model_name, usage, prompt_name = analyze_table(crop, cfg)
+                call_dur = time.time() - t_call
+                parsed = _parse_vlm(text, {"summary": text, "headers": [], "rows": []})
                 payload = {
-                    "table_data": {"status": "ok", "data": text},
+                    "title":        parsed.get("title", ""),
+                    "headers":      parsed.get("headers", []),
+                    "rows":         parsed.get("rows", []),
+                    "notes":        parsed.get("notes", ""),
+                    "summary":      parsed.get("summary", ""),
+                    "confidence":   parsed.get("confidence", 0.0),
                     "table_engine": "openai",
-                    "table_model": model_name,
+                    "table_model":  model_name,
+                    "_raw_response": text,
                 }
+                llm_calls.append({"model": model_name, "prompt_name": prompt_name,
+                                   "response_text": text, "usage": usage, "duration_s": call_dur})
             except Exception as exc:
-                # Fallback: OCR the table as plain text
                 ocr_result = _extract_text_paddle(crop)
-                payload = {
-                    "table_data": {"status": "fallback", "data": ocr_result.get("text", "")},
-                    "table_engine": "fallback",
-                }
-                warnings.append(f"table_node fallback for {block.block_id}: {exc}")
+                payload = {"summary": ocr_result.get("text", ""), "headers": [], "rows": [], "table_engine": "fallback"}
+                warnings.append(f"table fallback for {block.block_id}: {exc}")
 
     duration = time.time() - t0
     engine = (
@@ -297,12 +347,15 @@ def _process_block_task(task: Dict) -> Dict:
     )
     logger.debug("[%s] %s %s engine=%s t=%.3fs", kind, block.block_id, block.block_type.value, engine, duration)
     return {
-        "block_id": block.block_id,
-        "payload": payload,
-        "warnings": warnings,
+        "block_id":  block.block_id,
+        "page_index": block.page_index,
+        "block_type": block.block_type.value,
+        "payload":   payload,
+        "warnings":  warnings,
+        "llm_calls": llm_calls,   # buffered; recorded in main thread by _run_specialist_kind
         "_duration": duration,
-        "_engine": engine,
-        "_kind": kind,
+        "_engine":   engine,
+        "_kind":     kind,
     }
 
 
@@ -351,7 +404,8 @@ def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]
             bid = result["block_id"]
             updates[bid] = result["payload"]
             warnings.extend(result["warnings"])
-            # Record block event in trace
+
+            # ── Record block provenance in trace ─────────────────────────────
             if bid in block_map:
                 record_block(
                     trace,
@@ -360,6 +414,22 @@ def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]
                     engine=result.get("_engine", "unknown"),
                     duration_s=result.get("_duration", 0.0),
                     payload=result["payload"],
+                )
+
+            # ── Record every LLM call (thread-safe via list.append / GIL) ───
+            for call in result.get("llm_calls", []):
+                record_llm_call(
+                    trace,
+                    block_id=bid,
+                    page_index=result.get("page_index", -1),
+                    block_type=result.get("block_type", kind),
+                    specialist=result.get("_kind", kind),
+                    model=call["model"],
+                    prompt_name=call["prompt_name"],
+                    prompt_text=PROMPT_REGISTRY.get(call["prompt_name"], call["prompt_name"]),
+                    response_text=call["response_text"],
+                    usage=call["usage"],
+                    duration_s=call["duration_s"],
                 )
 
     return updates, warnings
@@ -563,6 +633,115 @@ def node_association(state: AgentState) -> AgentState:
 # Aggregate: build final structured output
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _build_full_text(blocks_ordered: List[DocumentBlock]) -> str:
+    """Concatenate all content blocks in reading order for RAG / downstream use.
+
+    Payload fields are now flat (parsed at ingest time), so no JSON re-parsing.
+    Blocks that are children absorbed into parents are skipped.
+    Headers / footers / other boilerplate are skipped.
+    Page breaks inserted as [PAGE N] markers.
+    """
+    lines: List[str] = []
+    current_page = -1
+
+    for block in blocks_ordered:
+        # Skip children absorbed into MIXED groups (parent renders them)
+        if block.skip_specialist and block.parent_id:
+            continue
+        # Skip containment-only children (formula inside text block, etc.)
+        if block.parent_id and block.block_type != BlockType.MIXED:
+            continue
+        # Skip boilerplate
+        if block.block_type in {BlockType.HEADER, BlockType.FOOTER, BlockType.OTHER}:
+            continue
+
+        if block.page_index != current_page:
+            current_page = block.page_index
+            if lines:
+                lines.append("")
+            lines.append(f"[PAGE {current_page + 1}]")
+            lines.append("")
+
+        p = block.payload
+        btype = block.block_type
+
+        if btype == BlockType.TEXT:
+            text = p.get("text", "").strip()
+            if text:
+                lines.append(text)
+
+        elif btype == BlockType.MIXED:
+            text = p.get("full_text", "").strip()
+            if text:
+                lines.append(text)
+
+        elif btype == BlockType.FORMULA:
+            # VLM may return null for any field; use `or ""` before .strip()
+            latex   = (p.get("latex")   or "").strip()
+            meaning = (p.get("meaning") or "").strip()
+            ftype   = (p.get("formula_type") or "").strip()
+            if latex:
+                lines.append(f"$$\n{latex}\n$$")
+                if meaning:
+                    lines.append(f"  [{ftype}: {meaning}]" if ftype else f"  [{meaning}]")
+            else:
+                lines.append("[FORMULA]")
+
+        elif btype == BlockType.TABLE:
+            def _s(v) -> str:
+                return (v or "").strip() if not isinstance(v, (list, dict)) else ""
+            summary = _s(p.get("summary"))
+            title   = _s(p.get("title"))
+            headers = p.get("headers") or []
+            rows    = p.get("rows") or []
+            notes   = _s(p.get("notes"))
+            lines.append(f"[TABLE: {title or summary}]" if (title or summary) else "[TABLE]")
+            if headers and rows:
+                lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+                lines.append("|" + "|".join(" --- " for _ in headers) + "|")
+                for row in rows:
+                    cells = [str(row.get(h) if row.get(h) is not None else "") for h in headers]
+                    lines.append("| " + " | ".join(cells) + " |")
+            if notes:
+                lines.append(f"_{notes}_")
+
+        elif btype in {BlockType.IMAGE, BlockType.FIGURE}:
+            summary      = ((p.get("summary") or "").strip())
+            visible_text = ((p.get("visible_text") or "").strip())
+            key_elements = p.get("key_elements") or []
+            lines.append(f"[IMAGE: {summary}]" if summary else "[IMAGE]")
+            if visible_text:
+                lines.append(f"  Visible text: {visible_text}")
+            if key_elements:
+                lines.append("  Key elements: " + ", ".join(str(e) for e in key_elements[:8]))
+
+        elif btype == BlockType.CHART:
+            def _sv(v) -> str:
+                if isinstance(v, list):
+                    return "; ".join(str(i) for i in v if i)
+                return str(v).strip() if v else ""
+            takeaway   = _sv(p.get("takeaway"))
+            trends     = _sv(p.get("trends"))
+            chart_type = _sv(p.get("chart_type"))
+            data_table = _sv(p.get("data_table"))
+            title      = _sv(p.get("title"))
+            header = f"[CHART ({chart_type}): {title}]" if title else f"[CHART ({chart_type})]" if chart_type else "[CHART]"
+            lines.append(header)
+            if takeaway:
+                lines.append(f"  Insight: {takeaway}")
+            if trends:
+                lines.append(f"  Trends: {trends}")
+            if data_table:
+                lines.append(data_table)
+
+        elif btype == BlockType.CAPTION:
+            text = (p.get("text") or "").strip()
+            if text:
+                lines.append(f"_{text}_")
+
+    return "\n".join(lines)
+
+
 def node_aggregate(state: AgentState) -> AgentState:
     trace = state.get("_trace") or {}
     entry = node_start(trace, "aggregate")
@@ -575,22 +754,40 @@ def node_aggregate(state: AgentState) -> AgentState:
     for b in ordered:
         type_counts[b.block_type.value] = type_counts.get(b.block_type.value, 0) + 1
 
+    full_text = _build_full_text(ordered)
+
+    # Reading order manifest: (block_id, page, type, short_preview)
+    reading_order = [
+        {
+            "block_id":     b.block_id,
+            "page":         b.page_index + 1,
+            "reading_order": b.reading_order,
+            "type":         b.block_type.value,
+            "bbox":         {"x1": b.bbox.x1, "y1": b.bbox.y1, "x2": b.bbox.x2, "y2": b.bbox.y2},
+        }
+        for b in ordered
+        if not (b.skip_specialist and b.parent_id)
+    ]
+
     node_end(entry)
     finish_trace(trace)
     logger.info("[aggregate] done - %d blocks, total pipeline %.2fs",
                 len(ordered), trace.get("total_duration_s", 0))
 
     output: Dict = {
-        "run_id": state.get("run_id"),
+        "run_id":     state.get("run_id"),
         "input_path": state.get("input_path"),
-        "status": "done",
-        "warnings": state.get("warnings", []),
-        "pages": state.get("page_sizes", []),
-        "blocks": [b.as_dict() for b in ordered],
+        "status":     "done",
+        "warnings":   state.get("warnings", []),
+        "pages":      state.get("page_sizes", []),
+        "blocks":     [b.as_dict() for b in ordered],
+        "full_text":  full_text,
+        "reading_order": reading_order,
         "summary": {
-            "num_pages": len(state.get("page_sizes", [])),
+            "num_pages":  len(state.get("page_sizes", [])),
             "num_blocks": len(ordered),
-            "types": type_counts,
+            "types":      type_counts,
+            "full_text_chars": len(full_text),
         },
     }
     return {**state, "output": output, "status": "done", "_trace": trace}

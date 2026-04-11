@@ -76,14 +76,24 @@ def _find_container(
 
 def _stitch_inline_math(page_blocks: List[DocumentBlock]) -> List[DocumentBlock]:
     """
-    Detect formula blocks that are on the same line as a text block and
-    create a MIXED parent block that covers both.
+    Detect formula blocks that are on the same line AS A NEIGHBOUR of a text block
+    and create a MIXED parent block that covers both.
 
     The original text and formula blocks are marked skip_specialist=True;
     the MIXED block is dispatched to the text+formula specialist instead.
+
+    IMPORTANT: formulas that are already *contained within* a text block (i.e.
+    parent_id is set by the containment step) are NOT stitched — they are
+    embedded symbols that the text block's crop already covers.
     """
     text_blocks = [b for b in page_blocks if b.block_type == BlockType.TEXT and not b.skip_specialist]
-    formula_blocks = [b for b in page_blocks if b.block_type == BlockType.FORMULA and not b.skip_specialist]
+    # Skip formulas that are already children of another block (containment step set their parent_id)
+    formula_blocks = [
+        b for b in page_blocks
+        if b.block_type == BlockType.FORMULA
+        and not b.skip_specialist
+        and b.parent_id is None          # not already contained in a parent
+    ]
 
     if not text_blocks or not formula_blocks:
         return page_blocks
@@ -91,10 +101,13 @@ def _stitch_inline_math(page_blocks: List[DocumentBlock]) -> List[DocumentBlock]
     new_blocks: List[DocumentBlock] = []
 
     for formula in formula_blocks:
-        # Find all text blocks on the same line and x-adjacent
+        # Find text blocks that are adjacent but NOT containing the formula
+        # (overlap_ratio < 0.5 guards against formula being mostly inside the text block bbox)
         partners = [
             t for t in text_blocks
-            if _same_line(formula, t) and _x_adjacent(formula, t)
+            if _same_line(formula, t)
+            and _x_adjacent(formula, t)
+            and _overlap_ratio(formula, t) < 0.5   # formula mostly outside text block
         ]
         if not partners:
             continue

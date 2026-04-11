@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import List
 
 from .types import BlockType, BoundingBox, DocumentBlock
@@ -11,29 +12,23 @@ def map_detector_label(label: str) -> BlockType:
     # ── Text family ───────────────────────────────────────────────────────────
     if normalized in {
         "text", "paragraph", "list", "reference", "abstract", "section",
-        # PP-DocLayout_plus-L specific
-        "reference_content",   # bibliography / references section body
-        "doc_title",           # document title
-        "aside_text",          # sidebar / margin text
+        "reference_content",
+        "doc_title",
+        "aside_text",
     }:
         return BlockType.TEXT
 
     if normalized in {
         "title", "heading", "headline", "section_title", "sub_title",
-        # PP-DocLayout_plus-L specific
-        "paragraph_title",     # section heading inside body
+        "paragraph_title",
     }:
-        # Kept as TEXT — detector_label distinguishes for reading order heuristics
         return BlockType.TEXT
 
     # ── Formula family ────────────────────────────────────────────────────────
     if normalized in {"formula", "equation", "inline_formula", "display_formula"}:
         return BlockType.FORMULA
 
-    if normalized in {
-        "formula_number",      # equation label "(1)", "(2)" next to a formula
-    }:
-        # Small numbered tag — treat as TEXT (not full formula processing)
+    if normalized in {"formula_number"}:
         return BlockType.TEXT
 
     # ── Table ─────────────────────────────────────────────────────────────────
@@ -53,8 +48,7 @@ def map_detector_label(label: str) -> BlockType:
     # ── Caption ───────────────────────────────────────────────────────────────
     if normalized in {
         "caption", "figure_caption", "table_caption_text",
-        # PP-DocLayout_plus-L specific
-        "figure_title",        # title / caption directly above or below a figure
+        "figure_title",
     }:
         return BlockType.CAPTION
 
@@ -64,33 +58,54 @@ def map_detector_label(label: str) -> BlockType:
 
     if normalized in {
         "footer", "page_footer", "footnote", "page_number",
-        # PP-DocLayout_plus-L specific
-        "number",              # standalone page number
+        "number",
     }:
         return BlockType.FOOTER
 
     return BlockType.OTHER
 
 
+# ── Lazy singleton for LayoutDetection ───────────────────────────────────────
+# Must be initialised in the main thread (before LangGraph starts its executor)
+# to avoid a crash in PaddlePaddle's oneDNN/TBB backend when model loading
+# happens concurrently with active threads.
+
+_LAYOUT_DETECTOR = None
+_LAYOUT_DETECTOR_LOADED = False
+_LAYOUT_DETECTOR_LOCK = threading.Lock()
+
+
+def get_layout_detector(warnings: List[str]):
+    """Return the shared LayoutDetection instance, initialising it once."""
+    global _LAYOUT_DETECTOR, _LAYOUT_DETECTOR_LOADED
+    if _LAYOUT_DETECTOR_LOADED:
+        return _LAYOUT_DETECTOR
+    with _LAYOUT_DETECTOR_LOCK:
+        if _LAYOUT_DETECTOR_LOADED:
+            return _LAYOUT_DETECTOR
+        _LAYOUT_DETECTOR_LOADED = True
+        try:
+            from paddleocr import LayoutDetection
+            _LAYOUT_DETECTOR = LayoutDetection()
+        except Exception as exc:
+            warnings.append(
+                f"LayoutDetection unavailable. Using page-level fallback. Details: {exc}"
+            )
+            _LAYOUT_DETECTOR = None
+    return _LAYOUT_DETECTOR
+
+
 def detect_layout_blocks(pages: List, warnings: List[str]) -> List[DocumentBlock]:
     """Detect layout blocks using PaddleOCR LayoutDetection (in-process).
 
-    Note: LayoutDetection and PaddleOCR OCR both use PaddlePaddle's oneDNN
-    backend.  Running LayoutDetection first "warms up" the runtime so that
-    PaddleOCR can initialise on top of it without crashing.  OMP_NUM_THREADS=1
-    (set by the re-exec guard in __main__.py) prevents the threading conflict
-    between their respective inference engines.
+    Both LayoutDetection and PaddleOCR OCR share PaddlePaddle's oneDNN/TBB
+    backend.  They must be initialised in the main thread *before* LangGraph
+    starts its executor threads (see cli.py pre-warm section).
     """
     blocks: List[DocumentBlock] = []
     block_num = 0
 
-    try:
-        from paddleocr import LayoutDetection
-
-        detector = LayoutDetection()
-    except Exception as exc:  # pragma: no cover
-        warnings.append(f"LayoutDetection unavailable. Using page-level fallback. Details: {exc}")
-        detector = None
+    detector = get_layout_detector(warnings)
 
     for page_idx, img in enumerate(pages):
         page_h, page_w = img.shape[:2]

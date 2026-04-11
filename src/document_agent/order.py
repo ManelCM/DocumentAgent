@@ -6,9 +6,8 @@ from typing import Dict, List, Optional, Tuple
 from .types import BlockType, DocumentBlock
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LayoutReader (microsoft/layoutreader) — deep learning reading order model
-# trained on ReadingBank (~500 k samples of academic / multi-column documents).
-# Normalises bounding boxes to [0, 1000] and runs a seq2seq permutation model.
+# LayoutReader (microsoft/layoutreader) — seq2seq permutation model
+# Trained on ReadingBank (~500 k samples of academic / multi-column documents).
 # ──────────────────────────────────────────────────────────────────────────────
 
 _LAYOUTREADER_MODEL: Optional[object] = None
@@ -38,7 +37,6 @@ def _load_layoutreader():
 
 
 def _normalize_boxes(blocks: List[DocumentBlock], page_w: int, page_h: int) -> List[List[int]]:
-    """Normalise bounding boxes to [0, 1000] as expected by LayoutReader."""
     boxes = []
     for b in blocks:
         x1 = max(0, min(1000, int(b.bbox.x1 / page_w * 1000)))
@@ -50,10 +48,6 @@ def _normalize_boxes(blocks: List[DocumentBlock], page_w: int, page_h: int) -> L
 
 
 def _layoutreader_predict(blocks: List[DocumentBlock], page_w: int, page_h: int) -> Optional[List[int]]:
-    """
-    Run LayoutReader and return a list of block indices in reading order.
-    Returns None if the model is unavailable or inference fails.
-    """
     model, tokenizer = _load_layoutreader()
     if model is None or tokenizer is None:
         return None
@@ -61,7 +55,6 @@ def _layoutreader_predict(blocks: List[DocumentBlock], page_w: int, page_h: int)
         import torch
 
         boxes = _normalize_boxes(blocks, page_w, page_h)
-        # LayoutReader tokenizer encodes boxes as special position tokens
         inputs = tokenizer(
             boxes=boxes,
             return_tensors="pt",
@@ -76,11 +69,8 @@ def _layoutreader_predict(blocks: List[DocumentBlock], page_w: int, page_h: int)
                 max_new_tokens=len(blocks) + 2,
                 num_beams=1,
             )
-        # Decode output token ids → block indices
         decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # The model outputs space-separated indices e.g. "2 0 3 1"
         order = [int(x) for x in decoded.split() if x.isdigit()]
-        # Validate: must be a permutation of [0, len(blocks)-1]
         if sorted(order) == list(range(len(blocks))):
             return order
         return None
@@ -89,56 +79,67 @@ def _layoutreader_predict(blocks: List[DocumentBlock], page_w: int, page_h: int)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Improved heuristic fallback — column detection via x-projection gap analysis
+# Column detection via x-center gap analysis on NARROW blocks
+#
+# Academic papers often have wide header blocks (title, authors, abstract)
+# that span 55-70% of the page and cover the column separator gap in a
+# pixel-coverage approach.  We fix this by:
+#   1. Only using narrow blocks (width < 50% of page) for analysis.
+#   2. Excluding HEADER / FOOTER blocks (boilerplate at page edges).
+#   3. Finding the largest consecutive gap in block x-centers that falls
+#      in the central 30-70% horizontal range of the page.
 # ──────────────────────────────────────────────────────────────────────────────
 
+_SKIP_TYPES = {BlockType.HEADER, BlockType.FOOTER}
+
+
 def _detect_column_boundaries(blocks: List[DocumentBlock], page_w: int) -> List[int]:
-    """
-    Find column separator x-positions by looking for vertical gaps
-    (x-ranges not covered by any block).
-    Returns sorted list of column separator x-positions (midpoints of gaps).
+    """Return column separator x-positions (midpoints of gaps in block-center distribution).
+
+    Strategy
+    --------
+    * Keep only narrow, body blocks (width < 50 % of page, not HEADER/FOOTER).
+    * Collect their x-center positions and sort them.
+    * Find the largest gap between consecutive centers that falls in the
+      horizontal range [30 %, 70 %] of the page.
+    * A gap must be at least 5 % of the page width to count as a separator.
+    * Supports up to 3 columns (takes the top-3 qualifying gaps if the page
+      has more than one separator).
     """
     if not blocks or page_w <= 0:
         return []
 
-    # Exclude full-width blocks (titles, abstracts) — they span the whole page
-    # and would mask column gaps in the histogram.
-    columnar = [b for b in blocks if not _is_full_width(b, page_w)]
-    if not columnar:
+    narrow = [
+        b for b in blocks
+        if b.block_type not in _SKIP_TYPES
+        and (b.bbox.x2 - b.bbox.x1) < 0.50 * page_w
+    ]
+    if len(narrow) < 3:
         return []
 
-    # Build coverage array
-    covered = [0] * page_w
-    for b in columnar:
-        for x in range(max(0, b.bbox.x1), min(page_w, b.bbox.x2)):
-            covered[x] += 1
+    centers = sorted(b.bbox.cx for b in narrow)
+    mid_lo = 0.30 * page_w
+    mid_hi = 0.70 * page_w
+    min_gap = 0.05 * page_w   # at least 5 % of page width
 
-    # Find gap segments (covered[x] == 0) in the central 20%-80% horizontal range
-    # to avoid being fooled by margins
-    left_margin = int(page_w * 0.20)
-    right_margin = int(page_w * 0.80)
-    gaps: List[Tuple[int, int]] = []
-    in_gap = False
-    gap_start = 0
-    for x in range(left_margin, right_margin):
-        if covered[x] == 0:
-            if not in_gap:
-                in_gap = True
-                gap_start = x
-        else:
-            if in_gap:
-                in_gap = False
-                gap_end = x
-                if gap_end - gap_start >= int(page_w * 0.015):  # min 1.5% gap width
-                    gaps.append((gap_start, gap_end))
-    if in_gap:
-        gaps.append((gap_start, right_margin))
+    candidate_gaps: List[Tuple[float, float]] = []   # (gap_size, midpoint)
+    for i in range(len(centers) - 1):
+        lo, hi = centers[i], centers[i + 1]
+        gap = hi - lo
+        # The gap must be wide enough AND straddle the central zone
+        if gap >= min_gap and lo <= mid_hi and hi >= mid_lo:
+            candidate_gaps.append((gap, (lo + hi) / 2.0))
 
-    return [(s + e) // 2 for s, e in gaps]
+    if not candidate_gaps:
+        return []
+
+    # Sort by gap size descending; keep at most 2 separators (3 columns)
+    candidate_gaps.sort(reverse=True)
+    separators = sorted(int(mid) for _, mid in candidate_gaps[:2])
+    return separators
 
 
 def _assign_column(block: DocumentBlock, separators: List[int]) -> int:
-    """Return 0-based column index for a block given column separator x-positions."""
     cx = block.bbox.cx
     col = 0
     for sep in sorted(separators):
@@ -149,45 +150,56 @@ def _assign_column(block: DocumentBlock, separators: List[int]) -> int:
     return col
 
 
-def _is_full_width(block: DocumentBlock, page_w: int, threshold: float = 0.65) -> bool:
-    """True if the block spans more than threshold of the page width (title, abstract, etc.)."""
+def _is_full_width(block: DocumentBlock, page_w: int, threshold: float = 0.60) -> bool:
+    """True if the block spans more than threshold of the page width."""
     return (block.bbox.x2 - block.bbox.x1) / max(1, page_w) >= threshold
 
 
-def _heuristic_order(
-    blocks: List[DocumentBlock], page_w: int, page_h: int
-) -> List[int]:
-    """
-    Improved column-aware heuristic:
-    1. Full-width blocks (titles, abstracts) are sorted first by y-centre.
-    2. Remaining blocks are assigned to columns and sorted column-by-column, top-to-bottom.
-    Returns list of original indices in reading order.
+# ──────────────────────────────────────────────────────────────────────────────
+# Heuristic reading order (column-aware)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _heuristic_order(blocks: List[DocumentBlock], page_w: int, page_h: int) -> List[int]:
+    """Column-aware heuristic reading order.
+
+    Pipeline
+    --------
+    1. HEADER blocks → top of reading order (sorted by y).
+    2. Full-width blocks (≥ 60 % of page width) → sorted by y; they read
+       before the columnar body because they are titles / abstracts.
+    3. Narrow body blocks → sorted by (column_index, cy) so left column
+       reads completely before right column starts.
+    4. FOOTER blocks → end of reading order (sorted by y).
     """
     separators = _detect_column_boundaries(blocks, page_w)
 
-    full_width = [(i, b) for i, b in enumerate(blocks) if _is_full_width(b, page_w)]
-    columnar = [(i, b) for i, b in enumerate(blocks) if not _is_full_width(b, page_w)]
+    headers  = [(i, b) for i, b in enumerate(blocks) if b.block_type == BlockType.HEADER]
+    footers  = [(i, b) for i, b in enumerate(blocks) if b.block_type == BlockType.FOOTER]
+    body     = [(i, b) for i, b in enumerate(blocks)
+                if b.block_type not in {BlockType.HEADER, BlockType.FOOTER}]
 
-    # Sort full-width blocks by y (top → bottom)
-    full_width.sort(key=lambda x: x[1].bbox.cy)
-
-    # For columnar blocks, separate HEADER/FOOTER (always first/last)
-    headers = [(i, b) for i, b in columnar if b.block_type in {BlockType.HEADER}]
-    footers = [(i, b) for i, b in columnar if b.block_type in {BlockType.FOOTER}]
-    body = [(i, b) for i, b in columnar if b.block_type not in {BlockType.HEADER, BlockType.FOOTER}]
+    # Split body into spanning blocks (titles / abstracts) and columnar blocks
+    spanning  = [(i, b) for i, b in body if _is_full_width(b, page_w)]
+    columnar  = [(i, b) for i, b in body if not _is_full_width(b, page_w)]
 
     headers.sort(key=lambda x: x[1].bbox.cy)
     footers.sort(key=lambda x: x[1].bbox.cy)
+    spanning.sort(key=lambda x: x[1].bbox.cy)
 
     if separators:
-        body.sort(key=lambda x: (_assign_column(x[1], separators), x[1].bbox.cy, x[1].bbox.cx))
+        columnar.sort(key=lambda x: (
+            _assign_column(x[1], separators),
+            x[1].bbox.cy,
+            x[1].bbox.cx,
+        ))
     else:
-        body.sort(key=lambda x: (x[1].bbox.cy, x[1].bbox.cx))
+        # Single-column page: simple top-to-bottom, left-to-right
+        columnar.sort(key=lambda x: (x[1].bbox.cy, x[1].bbox.cx))
 
     order = (
         [i for i, _ in headers]
-        + [i for i, _ in full_width]
-        + [i for i, _ in body]
+        + [i for i, _ in spanning]
+        + [i for i, _ in columnar]
         + [i for i, _ in footers]
     )
     return order
@@ -201,18 +213,15 @@ def apply_reading_order(
     blocks: List[DocumentBlock],
     page_sizes: Optional[List[Dict]] = None,
 ) -> List[DocumentBlock]:
-    """
-    Assign reading_order index to every block.
+    """Assign reading_order index to every block.
 
-    Strategy (per page):
-      1. Try LayoutReader (microsoft/layoutreader trained on ReadingBank).
-      2. Fall back to improved column-aware heuristic.
+    1. Tries LayoutReader (microsoft/layoutreader) first.
+    2. Falls back to the column-aware heuristic.
     """
     by_page: Dict[int, List[DocumentBlock]] = {}
     for b in blocks:
         by_page.setdefault(b.page_index, []).append(b)
 
-    # Build page size lookup
     size_by_page: Dict[int, Dict] = {}
     if page_sizes:
         for ps in page_sizes:
@@ -223,13 +232,10 @@ def apply_reading_order(
             continue
 
         ps = size_by_page.get(page_idx, {})
-        page_w = int(ps.get("width", max(b.bbox.x2 for b in page_blocks)))
+        page_w = int(ps.get("width",  max(b.bbox.x2 for b in page_blocks)))
         page_h = int(ps.get("height", max(b.bbox.y2 for b in page_blocks)))
 
-        # Attempt LayoutReader
         order_indices = _layoutreader_predict(page_blocks, page_w, page_h)
-
-        # Fallback
         if order_indices is None:
             order_indices = _heuristic_order(page_blocks, page_w, page_h)
 

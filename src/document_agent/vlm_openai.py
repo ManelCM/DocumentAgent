@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 
@@ -58,6 +59,15 @@ Return ONLY valid JSON with these keys:
 - summary: one-sentence description of what the table shows
 - confidence: float 0-1"""
 
+# Map prompt name → prompt text (for traceability)
+PROMPT_REGISTRY: Dict[str, str] = {
+    "IMAGE_PROMPT": IMAGE_PROMPT,
+    "CHART_PROMPT": CHART_PROMPT,
+    "FORMULA_PROMPT": FORMULA_PROMPT,
+    "MIXED_PROMPT": MIXED_PROMPT,
+    "TABLE_PROMPT": TABLE_PROMPT,
+}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -85,7 +95,23 @@ def load_vlm_config() -> OpenAIVLMConfig:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core call
+# Token cost table  (USD per 1M tokens, gpt-4.1-mini as of 2025-04)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_COST_PER_1M: Dict[str, Dict[str, float]] = {
+    "gpt-4.1-mini":   {"input": 0.40,  "output": 1.60},
+    "gpt-4.1":        {"input": 2.00,  "output": 8.00},
+    "gpt-4o":         {"input": 2.50,  "output": 10.00},
+    "gpt-4o-mini":    {"input": 0.15,  "output": 0.60},
+}
+
+def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    rates = _COST_PER_1M.get(model, _COST_PER_1M["gpt-4.1-mini"])
+    return (prompt_tokens * rates["input"] + completion_tokens * rates["output"]) / 1_000_000
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core call  — returns (response_text, usage_dict, prompt_text, call_duration_s)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _img_to_data_url(img) -> str:
@@ -109,9 +135,26 @@ def _extract_content_text(message_content) -> str:
     return ""
 
 
-def _run_openai_vision(prompt: str, model: str, img, api_key: str) -> str:
+def _run_openai_vision(
+    prompt: str,
+    model: str,
+    img,
+    api_key: str,
+) -> Tuple[str, Dict, float]:
+    """Call the OpenAI vision API.
+
+    Returns
+    -------
+    text : str
+        Raw JSON string from the model.
+    usage : dict
+        {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N, "cost_usd": F}
+    duration_s : float
+        Wall-clock time for the API call.
+    """
     from openai import OpenAI
 
+    t0 = time.time()
     data_url = _img_to_data_url(img)
     client = OpenAI(api_key=api_key)
     resp = client.chat.completions.create(
@@ -129,39 +172,57 @@ def _run_openai_vision(prompt: str, model: str, img, api_key: str) -> str:
             },
         ],
     )
-    return _extract_content_text(resp.choices[0].message.content).strip()
+    duration_s = time.time() - t0
+
+    u = resp.usage
+    pt = u.prompt_tokens if u else 0
+    ct = u.completion_tokens if u else 0
+    usage = {
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "total_tokens": pt + ct,
+        "cost_usd": round(estimate_cost_usd(model, pt, ct), 6),
+    }
+    text = _extract_content_text(resp.choices[0].message.content).strip()
+    return text, usage, duration_s
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public helpers
+# Each returns (response_text, model, usage_dict, prompt_name)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def analyze_image(img, cfg: OpenAIVLMConfig) -> Tuple[str, str]:
+def analyze_image(img, cfg: OpenAIVLMConfig) -> Tuple[str, str, Dict, str]:
     if not cfg.api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
-    return _run_openai_vision(IMAGE_PROMPT, cfg.image_model, img, cfg.api_key), cfg.image_model
+    text, usage, _ = _run_openai_vision(IMAGE_PROMPT, cfg.image_model, img, cfg.api_key)
+    return text, cfg.image_model, usage, "IMAGE_PROMPT"
 
 
-def analyze_chart(img, cfg: OpenAIVLMConfig) -> Tuple[str, str]:
+def analyze_chart(img, cfg: OpenAIVLMConfig) -> Tuple[str, str, Dict, str]:
     if not cfg.api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
-    return _run_openai_vision(CHART_PROMPT, cfg.chart_model, img, cfg.api_key), cfg.chart_model
+    text, usage, _ = _run_openai_vision(CHART_PROMPT, cfg.chart_model, img, cfg.api_key)
+    return text, cfg.chart_model, usage, "CHART_PROMPT"
 
 
-def analyze_formula(img, cfg: OpenAIVLMConfig) -> Tuple[str, str]:
+def analyze_formula(img, cfg: OpenAIVLMConfig) -> Tuple[str, str, Dict, str]:
     if not cfg.api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
-    return _run_openai_vision(FORMULA_PROMPT, cfg.formula_model, img, cfg.api_key), cfg.formula_model
+    text, usage, _ = _run_openai_vision(FORMULA_PROMPT, cfg.formula_model, img, cfg.api_key)
+    return text, cfg.formula_model, usage, "FORMULA_PROMPT"
 
 
-def analyze_mixed(img, cfg: OpenAIVLMConfig) -> Tuple[str, str]:
+def analyze_mixed(img, cfg: OpenAIVLMConfig) -> Tuple[str, str, Dict, str]:
     """Analyze a MIXED block (inline math embedded in prose text)."""
     if not cfg.api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
-    return _run_openai_vision(MIXED_PROMPT, cfg.mixed_model, img, cfg.api_key), cfg.mixed_model
+    text, usage, _ = _run_openai_vision(MIXED_PROMPT, cfg.mixed_model, img, cfg.api_key)
+    return text, cfg.mixed_model, usage, "MIXED_PROMPT"
 
 
-def analyze_table(img, cfg: OpenAIVLMConfig) -> Tuple[str, str]:
+def analyze_table(img, cfg: OpenAIVLMConfig) -> Tuple[str, str, Dict, str]:
     if not cfg.api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
-    return _run_openai_vision(TABLE_PROMPT, cfg.table_model, img, cfg.api_key), cfg.table_model
+    text, usage, _ = _run_openai_vision(TABLE_PROMPT, cfg.table_model, img, cfg.api_key)
+    return text, cfg.table_model, usage, "TABLE_PROMPT"
