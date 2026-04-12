@@ -1,0 +1,243 @@
+{
+  "total_duration_s": 183.9193,
+  "num_blocks_traced": 430,
+  "num_llm_calls": 113,
+  "total_prompt_tokens": 29528,
+  "total_completion_tokens": 31525,
+  "total_tokens": 61053,
+  "total_cost_usd": 0.062251,
+  "model_breakdown": {
+    "gpt-4.1-mini": {
+      "calls": 113,
+      "prompt_tokens": 29528,
+      "completion_tokens": 31525,
+      "cost_usd": 0.062251
+    }
+  },
+  "node_timing_s": {
+    "load_document": 0.4971,
+    "detect_layout": 99.0674,
+    "hierarchy": 0.0379,
+    "reading_order": 0.003,
+    "chart_specialist": 30.2442,
+    "formula_specialist": 84.2279,
+    "image_specialist": 13.0619,
+    "mixed_specialist": 9.8196,
+    "other_specialist": 8.9329,
+    "table_specialist": 46.4142,
+    "text_specialist": 33.9624,
+    "reduce_specialists": 0.0,
+    "cross_reference": 0.0075,
+    "association": 0.0,
+    "aggregate": 0.0673
+  },
+  "type_distribution": {
+    "footer": 25,
+    "text": 249,
+    "caption": 24,
+    "header": 19,
+    "mixed": 2,
+    "formula": 84,
+    "chart": 9,
+    "image": 2,
+    "table": 16
+  },
+  "engine_distribution": {
+    "pytesseract": 317,
+    "openai": 113
+  },
+  "blocks_per_page": {
+    "0": 13,
+    "1": 18,
+    "2": 42,
+    "3": 33,
+    "4": 28,
+    "5": 29,
+    "6": 18,
+    "7": 17,
+    "8": 24,
+    "9": 17,
+    "10": 20,
+    "11": 26,
+    "12": 24,
+    "13": 21,
+    "14": 11,
+    "15": 25,
+    "16": 15,
+    "17": 33,
+    "18": 12,
+    "19": 4
+  },
+  "slowest_blocks": [
+    {
+      "block_id": "b169",
+      "page_index": 6,
+      "type": "table",
+      "detector_label": "table",
+      "confidence": 0.9816,
+      "reading_order": 2,
+      "bbox": {
+        "x1": 173,
+        "y1": 257,
+        "x2": 1471,
+        "y2": 482
+      },
+      "specialist": "table",
+      "engine": "openai",
+      "duration_s": 22.7682
+    },
+    {
+      "block_id": "b184",
+      "page_index": 7,
+      "type": "table",
+      "detector_label": "table",
+      "confidence": 0.9878,
+      "reading_order": 2,
+      "bbox": {
+        "x1": 362,
+        "y1": 231,
+        "x2": 1284,
+        "y2": 582
+      },
+      "specialist": "table",
+      "engine": "openai",
+      "duration_s": 18.0867
+    },
+    {
+      "block_id": "b185",
+      "page_index": 7,
+      "type": "table",
+      "detector_label": "table",
+      "confidence": 0.9865,
+      "reading_order": 4,
+      "bbox": {
+        "x1": 284,
+        "y1": 687,
+        "x2": 1361,
+        "y2": 1009
+      },
+      "specialist": "table",
+      "engine": "openai",
+      "duration_s": 17.9961
+    },
+    {
+      "block_id": "b27",
+      "page_index": 1,
+      "type": "chart",
+      "detector_label": "chart",
+      "confidence": 0.7061,
+      "reading_order": 1,
+      "bbox": {
+        "x1": 160,
+        "y1": 200,
+        "x2": 1481,
+        "y2": 428
+      },
+      "specialist": "chart",
+      "engine": "openai",
+      "duration_s": 16.424
+    },
+    {
+      "block_id": "b30",
+      "page_index": 1,
+      "type": "chart",
+      "detector_label": "chart",
+      "confidence": 0.6026,
+      "reading_order": 1,
+      "bbox": {
+        "x1": 614,
+        "y1": 203,
+        "x2": 1027,
+        "y2": 429
+      },
+      "specialist": "chart",
+      "engine": "openai",
+      "duration_s": 14.2771
+    },
+    {
+      "block_id": "b17",
+      "page_index": 1,
+      "type": "table",
+      "detector_label": "table",
+      "confidence": 0.9823,
+      "reading_order": 10,
+      "bbox": {
+        "x1": 854,
+        "y1": 697,
+        "x2": 1491,
+        "y2": 938
+      },
+      "specialist": "table",
+      "engine": "openai",
+      "duration_s": 13.5445
+    },
+    {
+      "block_id": "b294",
+      "page_index": 12,
+      "type": "formula",
+      "detector_label": "formula",
+      "confidence": 0.965,
+      "reading_order": 8,
+      "bbox": {
+        "x1": 562,
+        "y1": 870,
+        "x2": 1084,
+        "y2": 1253
+      },
+      "specialist": "formula",
+      "engine": "openai",
+      "duration_s": 13.4423
+    },
+    {
+      "block_id": "b42",
+      "page_index": 2,
+      "type": "formula",
+      "detector_label": "formula",
+      "confidence": 0.9564,
+      "reading_order": 25,
+      "bbox": {
+        "x1": 272,
+        "y1": 1913,
+        "x2": 676,
+        "y2": 1995
+      },
+      "specialist": "formula",
+      "engine": "openai",
+      "duration_s": 13.0886
+    },
+    {
+      "block_id": "b78",
+      "page_index": 3,
+      "type": "image",
+      "detector_label": "image",
+      "confidence": 0.9731,
+      "reading_order": 1,
+      "bbox": {
+        "x1": 231,
+        "y1": 187,
+        "x2": 1427,
+        "y2": 556
+      },
+      "specialist": "image",
+      "engine": "openai",
+      "duration_s": 13.0578
+    },
+    {
+      "block_id": "b111",
+      "page_index": 4,
+      "type": "image",
+      "detector_label": "image",
+      "confidence": 0.9804,
+      "reading_order": 1,
+      "bbox": {
+        "x1": 162,
+        "y1": 196,
+        "x2": 1501,
+        "y2": 557
+      },
+      "specialist": "image",
+      "engine": "openai",
+      "duration_s": 12.4574
+    }
+  ]
+}
