@@ -50,10 +50,10 @@ def build_graph():
         # ── Edges ────────────────────────────────────────────────────────────
         graph.set_entry_point("load_document")
         graph.add_edge("load_document", "detect_layout")
-        graph.add_edge("detect_layout", "reading_order")
-        graph.add_edge("reading_order", "hierarchy")
+        graph.add_edge("detect_layout", "hierarchy")
+        graph.add_edge("hierarchy", "reading_order")
 
-        # Fan-out: hierarchy → all specialists in parallel
+        # Fan-out: reading_order → all specialists in parallel
         for specialist in [
             "text_specialist",
             "mixed_specialist",
@@ -63,7 +63,7 @@ def build_graph():
             "table_specialist",
             "other_specialist",
         ]:
-            graph.add_edge("hierarchy", specialist)
+            graph.add_edge("reading_order", specialist)
             graph.add_edge(specialist, "reduce_specialists")
 
         graph.add_edge("reduce_specialists", "cross_reference")
@@ -80,8 +80,8 @@ def build_graph():
                 for fn in [
                     node_load_document,
                     node_detect_layout,
-                    node_reading_order,
                     node_hierarchy,
+                    node_reading_order,
                     node_text_specialist,
                     node_mixed_specialist,
                     node_image_specialist,

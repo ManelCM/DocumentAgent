@@ -58,11 +58,98 @@ def node_load_document(state: AgentState) -> AgentState:
 # Layout detection
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _iou(a: "DocumentBlock", b: "DocumentBlock") -> float:
+    """Intersection-over-Union of two bounding boxes."""
+    ix1 = max(a.bbox.x1, b.bbox.x1)
+    iy1 = max(a.bbox.y1, b.bbox.y1)
+    ix2 = min(a.bbox.x2, b.bbox.x2)
+    iy2 = min(a.bbox.y2, b.bbox.y2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    union = a.bbox.area + b.bbox.area - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _deduplicate_blocks(
+    blocks: List[DocumentBlock],
+    iou_threshold: float = 0.5,
+) -> List[DocumentBlock]:
+    """Remove duplicate / heavily-overlapping blocks on the same page.
+
+    When two blocks of the *same* type overlap with IoU ≥ iou_threshold,
+    keep whichever has the higher detector confidence (the other is dropped).
+    Cross-type overlaps are left to the hierarchy node to resolve via
+    containment/absorption logic.
+
+    Typical source of duplicates: some layout models fire two bounding boxes
+    for the same region at slightly different scales (common on scanned docs).
+    """
+    if not blocks:
+        return blocks
+
+    # Group by page to reduce O(n²) comparisons
+    by_page: Dict[int, List[DocumentBlock]] = {}
+    for b in blocks:
+        by_page.setdefault(b.page_index, []).append(b)
+
+    kept: List[DocumentBlock] = []
+    for page_blocks in by_page.values():
+        # Sort descending by confidence so higher-confidence blocks are kept first
+        sorted_page = sorted(page_blocks, key=lambda b: b.confidence, reverse=True)
+        accepted: List[DocumentBlock] = []
+        for candidate in sorted_page:
+            duplicate = False
+            for existing in accepted:
+                if (existing.block_type == candidate.block_type
+                        and _iou(candidate, existing) >= iou_threshold):
+                    duplicate = True
+                    break
+            if not duplicate:
+                accepted.append(candidate)
+        kept.extend(accepted)
+
+    return kept
+
+
 def node_detect_layout(state: AgentState) -> AgentState:
     trace = state.get("_trace", init_trace())
     entry = node_start(trace, "detect_layout")
     warnings = list(state.get("warnings", []))
     blocks = detect_layout_blocks(state["pages"], warnings)
+
+    # Confidence threshold: drop detector results below min confidence.
+    # Fallback blocks (confidence=1.0, label="page_fallback") are never dropped.
+    # Default 0.3 catches garbage detections on noisy/scanned documents without
+    # discarding real content. Override with DOCAGENT_MIN_CONFIDENCE env var.
+    import os as _os
+    min_conf = float(_os.getenv("DOCAGENT_MIN_CONFIDENCE", "0.3"))
+    kept, dropped = [], []
+    for b in blocks:
+        if b.detector_label in {"page_fallback", "page_empty_fallback"} or b.confidence >= min_conf:
+            kept.append(b)
+        else:
+            dropped.append(b)
+    if dropped:
+        warnings.append(
+            f"[detect_layout] dropped {len(dropped)} low-confidence blocks "
+            f"(threshold={min_conf})"
+        )
+    blocks = kept
+
+    # Deduplication: remove same-type overlapping blocks (scanned-doc artefacts).
+    # Override with DOCAGENT_DEDUP_IOU=0 to disable.
+    iou_threshold = float(_os.getenv("DOCAGENT_DEDUP_IOU", "0.5"))
+    if iou_threshold > 0:
+        before = len(blocks)
+        blocks = _deduplicate_blocks(blocks, iou_threshold)
+        n_removed = before - len(blocks)
+        if n_removed:
+            warnings.append(
+                f"[detect_layout] removed {n_removed} duplicate blocks "
+                f"(IoU≥{iou_threshold})"
+            )
+
     node_end(entry)
     logger.info("[detect_layout] %d blocks detected in %.2fs", len(blocks), entry["duration_s"])
     return {**state, "blocks": blocks, "warnings": warnings, "_trace": trace}
@@ -163,8 +250,17 @@ def _extract_text_paddle(crop) -> Dict:
     # Tesseract (primary text engine — PaddleOCR intentionally disabled)
     try:
         import pytesseract
-        text = pytesseract.image_to_string(crop)
-        return {"text": text.strip(), "ocr_engine": "pytesseract"}
+        # Use image_to_data to get per-word confidence scores.
+        # Words with confidence < threshold are dropped (catches OCR noise).
+        min_conf = int(os.getenv("DOCAGENT_TESSERACT_MIN_CONF", "30"))
+        data = pytesseract.image_to_data(crop, output_type=pytesseract.Output.DICT)
+        words, confs = data["text"], data["conf"]
+        kept = [w for w, c in zip(words, confs) if str(c).lstrip("-").isdigit() and int(c) >= min_conf and w.strip()]
+        text = " ".join(kept)
+        # Compute average confidence over all detected words (not just kept ones)
+        valid_confs = [int(c) for c in confs if str(c).lstrip("-").isdigit() and int(c) >= 0]
+        avg_conf = round(sum(valid_confs) / len(valid_confs) / 100.0, 3) if valid_confs else 0.0
+        return {"text": text.strip(), "ocr_engine": "pytesseract", "ocr_confidence": avg_conf}
     except Exception as exc:
         return {"text": "", "ocr_engine": "fallback", "ocr_error": str(exc)}
 
@@ -393,7 +489,11 @@ def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]
     if not tasks:
         return {}, []
 
-    max_workers = max(1, min(int(os.getenv("DOCAGENT_MAX_WORKERS", "4")), len(tasks)))
+    # Per-kind worker override, e.g. DOCAGENT_FORMULA_MAX_WORKERS=16
+    kind_env = f"DOCAGENT_{kind.upper()}_MAX_WORKERS"
+    global_default = int(os.getenv("DOCAGENT_MAX_WORKERS", "8"))
+    desired = int(os.getenv(kind_env, str(global_default)))
+    max_workers = max(1, min(desired, len(tasks)))
     updates: Dict[str, Dict] = {}
     warnings: List[str] = []
 
@@ -536,8 +636,9 @@ def node_reduce_specialists(state: AgentState) -> AgentState:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Cross-reference detection
+# Cross-reference detection + resolution
 # Scans OCR'd text blocks for "Figure X", "Table X", "Equation X", "[N]" etc.
+# Then resolves each mention to the actual block it refers to.
 # ──────────────────────────────────────────────────────────────────────────────
 
 _XREF_PATTERNS = [
@@ -545,16 +646,68 @@ _XREF_PATTERNS = [
     (re.compile(r"\btable\.?\s*(\d+[a-z]?)\b", re.I), "table"),
     (re.compile(r"\beq(?:uation)?\.?\s*(\d+[a-z]?)\b", re.I), "equation"),
     (re.compile(r"\bsec(?:tion)?\.?\s*(\d+[\.\d]*)\b", re.I), "section"),
+    (re.compile(r"\balg(?:orithm)?\.?\s*(\d+[a-z]?)\b", re.I), "algorithm"),
+    (re.compile(r"\blisting\.?\s*(\d+[a-z]?)\b", re.I), "listing"),
     (re.compile(r"\[(\d+)\]", re.I), "citation"),
 ]
 
+# Caption-start patterns used to build the label→block index
+_CAPTION_LABEL_PATTERN = re.compile(
+    r"^(fig(?:ure)?|table|eq(?:uation)?|algorithm|alg|listing)\s*\.?\s*(\d+[a-z]?)\b",
+    re.I,
+)
+_CAPTION_TYPE_MAP = {
+    "fig": "figure", "figure": "figure",
+    "table": "table",
+    "eq": "equation", "equation": "equation",
+    "algorithm": "algorithm", "alg": "algorithm",
+    "listing": "listing",
+}
+
+
+def _build_label_index(blocks: List[DocumentBlock]) -> Dict[Tuple[str, str], str]:
+    """Return {(ref_type, label) → block_id} built from caption text.
+
+    Looks for captions that start with "Figure 3", "Table 2", etc.
+    Maps to the figure/table block the caption describes.
+    """
+    index: Dict[Tuple[str, str], str] = {}
+    for block in blocks:
+        if block.block_type != BlockType.CAPTION:
+            continue
+        text = (block.payload.get("text") or "").strip()
+        m = _CAPTION_LABEL_PATTERN.match(text)
+        if not m:
+            continue
+        raw_type = m.group(1).lower()
+        ref_type = _CAPTION_TYPE_MAP.get(raw_type, raw_type)
+        label = m.group(2).lower()
+        # The caption's `describes` relation points to the figure/table block
+        target_id = block.relations.get("describes")
+        if target_id:
+            index[(ref_type, label)] = target_id
+        # Also index by the caption block itself (some refs point to captions)
+        index[(ref_type, label + "_cap")] = block.block_id
+    return index
+
 
 def node_cross_reference(state: AgentState) -> AgentState:
-    """Scan text payloads for references to figures, tables, equations, citations."""
+    """Scan text payloads for references to figures, tables, equations, citations.
+
+    Each found reference is resolved to a target block_id when possible, adding
+    a ``target_id`` field to the reference dict.  The target block gains a
+    ``referenced_by`` list so the graph is navigable in both directions.
+    """
     trace = state.get("_trace") or {}
     entry = node_start(trace, "cross_reference")
     blocks = state.get("blocks", [])
+
+    # Build label index from captions (requires association to have run first)
+    label_index = _build_label_index(blocks)
+    id_to_block = {b.block_id: b for b in blocks}
+
     total_refs = 0
+    resolved = 0
 
     for block in blocks:
         if block.block_type not in {BlockType.TEXT, BlockType.MIXED}:
@@ -566,14 +719,30 @@ def node_cross_reference(state: AgentState) -> AgentState:
         refs = []
         for pattern, ref_type in _XREF_PATTERNS:
             for match in pattern.finditer(text):
-                refs.append({"type": ref_type, "label": match.group(1), "context": match.group(0)})
+                label = match.group(1).lower()
+                ref = {"type": ref_type, "label": label, "context": match.group(0)}
+                # Resolve to target block
+                target_id = label_index.get((ref_type, label))
+                if target_id:
+                    ref["target_id"] = target_id
+                    # Back-link on the target block
+                    target = id_to_block.get(target_id)
+                    if target:
+                        target.relations.setdefault("referenced_by", [])
+                        if block.block_id not in target.relations["referenced_by"]:
+                            target.relations["referenced_by"].append(block.block_id)
+                    resolved += 1
+                refs.append(ref)
 
         if refs:
             block.relations["references"] = refs
             total_refs += len(refs)
 
     node_end(entry)
-    logger.info("[cross_reference] %d references found in %.2fs", total_refs, entry["duration_s"])
+    logger.info(
+        "[cross_reference] %d references found (%d resolved) in %.2fs",
+        total_refs, resolved, entry["duration_s"],
+    )
     return {**state, "blocks": blocks, "_trace": trace}
 
 
@@ -614,13 +783,14 @@ def node_association(state: AgentState) -> AgentState:
             fig.relations["is_page_image"] = True
             fig.relations["page_coverage"] = round(float(coverage), 4)
 
-    # Embedded formulas (those absorbed into MIXED blocks)
+    # Embedded formulas: map formula children onto any parent that can render them
     id_to_block = {b.block_id: b for b in blocks}
     formulas = [b for b in blocks if b.block_type == BlockType.FORMULA]
     for formula in formulas:
         if formula.parent_id and formula.parent_id in id_to_block:
             parent = id_to_block[formula.parent_id]
-            if parent.block_type in {BlockType.TEXT, BlockType.MIXED}:
+            if parent.block_type in {BlockType.TEXT, BlockType.MIXED,
+                                     BlockType.TABLE, BlockType.CAPTION}:
                 parent.relations.setdefault("embedded_formulas", []).append(formula.block_id)
                 formula.relations["embedded_in"] = parent.block_id
 
@@ -633,14 +803,32 @@ def node_association(state: AgentState) -> AgentState:
 # Aggregate: build final structured output
 # ──────────────────────────────────────────────────────────────────────────────
 
+import re as _re
+
+
+def _dehyphenate(text: str) -> str:
+    """Join words split across line-breaks by a hyphen.
+
+    Handles both intra-column breaks ("dis-\ntillation") and
+    inter-column breaks where a word ends the left column and
+    continues at the start of the right column.
+    """
+    # Pattern: word-char, hyphen, newline (optional spaces), word-char
+    return _re.sub(r"(\w)-\n\s*(\w)", r"\1\2", text)
+
+
 def _build_full_text(blocks_ordered: List[DocumentBlock]) -> str:
     """Concatenate all content blocks in reading order for RAG / downstream use.
 
     Payload fields are now flat (parsed at ingest time), so no JSON re-parsing.
-    Blocks that are children absorbed into parents are skipped.
+    Blocks that are children absorbed into parents are skipped (except their
+    embedded formulas, which are appended after the parent text).
     Headers / footers / other boilerplate are skipped.
     Page breaks inserted as [PAGE N] markers.
     """
+    # Build full block map so we can look up children (formula embeddings)
+    block_map = {b.block_id: b for b in blocks_ordered}
+
     lines: List[str] = []
     current_page = -1
 
@@ -651,9 +839,16 @@ def _build_full_text(blocks_ordered: List[DocumentBlock]) -> str:
         # Skip containment-only children (formula inside text block, etc.)
         if block.parent_id and block.block_type != BlockType.MIXED:
             continue
-        # Skip boilerplate
+        # Skip boilerplate and vertical margin annotations
         if block.block_type in {BlockType.HEADER, BlockType.FOOTER, BlockType.OTHER}:
             continue
+        if block.detector_label == "aside_text":
+            continue
+        # Skip noise: text blocks with no meaningful content (tiny margin artifacts)
+        if block.block_type == BlockType.TEXT:
+            raw_text = block.payload.get("text", "") or ""
+            if len(raw_text.strip()) < 3:
+                continue
 
         if block.page_index != current_page:
             current_page = block.page_index
@@ -666,12 +861,30 @@ def _build_full_text(blocks_ordered: List[DocumentBlock]) -> str:
         btype = block.block_type
 
         if btype == BlockType.TEXT:
-            text = p.get("text", "").strip()
+            text = _dehyphenate(p.get("text", "") or "").strip()
             if text:
                 lines.append(text)
+            # Embed child formulas (already have LaTeX from formula specialist)
+            for fid in sorted(
+                block.relations.get("embedded_formulas", []),
+                key=lambda fid: (
+                    block_map[fid].bbox.y1 if fid in block_map else 0,
+                    block_map[fid].bbox.x1 if fid in block_map else 0,
+                ),
+            ):
+                child = block_map.get(fid)
+                if not child:
+                    continue
+                fp = child.payload or {}
+                latex = (fp.get("latex") or "").strip()
+                meaning = (fp.get("meaning") or "").strip()
+                if latex:
+                    lines.append(f"  {{formula: {latex}}}")
+                    if meaning:
+                        lines.append(f"  [meaning: {meaning}]")
 
         elif btype == BlockType.MIXED:
-            text = p.get("full_text", "").strip()
+            text = _dehyphenate(p.get("full_text", "") or "").strip()
             if text:
                 lines.append(text)
 
@@ -690,12 +903,15 @@ def _build_full_text(blocks_ordered: List[DocumentBlock]) -> str:
         elif btype == BlockType.TABLE:
             def _s(v) -> str:
                 return (v or "").strip() if not isinstance(v, (list, dict)) else ""
-            summary = _s(p.get("summary"))
-            title   = _s(p.get("title"))
-            headers = p.get("headers") or []
-            rows    = p.get("rows") or []
-            notes   = _s(p.get("notes"))
+            summary     = _s(p.get("summary"))
+            title       = _s(p.get("title"))
+            headers     = p.get("headers") or []
+            rows        = p.get("rows") or []
+            row_headers = p.get("row_headers") or []
+            notes       = _s(p.get("notes"))
             lines.append(f"[TABLE: {title or summary}]" if (title or summary) else "[TABLE]")
+            if row_headers:
+                lines.append(f"  Row labels: {', '.join(str(r) for r in row_headers)}")
             if headers and rows:
                 lines.append("| " + " | ".join(str(h) for h in headers) + " |")
                 lines.append("|" + "|".join(" --- " for _ in headers) + "|")
@@ -704,6 +920,24 @@ def _build_full_text(blocks_ordered: List[DocumentBlock]) -> str:
                     lines.append("| " + " | ".join(cells) + " |")
             if notes:
                 lines.append(f"_{notes}_")
+            # Emit formulas that live inside this table (e.g. cell equations)
+            for fid in sorted(
+                block.relations.get("embedded_formulas", []),
+                key=lambda fid: (
+                    block_map[fid].bbox.y1 if fid in block_map else 0,
+                    block_map[fid].bbox.x1 if fid in block_map else 0,
+                ),
+            ):
+                child = block_map.get(fid)
+                if not child:
+                    continue
+                fp = child.payload or {}
+                latex = (fp.get("latex") or "").strip()
+                meaning = (fp.get("meaning") or "").strip()
+                if latex:
+                    lines.append(f"  {{formula: {latex}}}")
+                    if meaning:
+                        lines.append(f"  [meaning: {meaning}]")
 
         elif btype in {BlockType.IMAGE, BlockType.FIGURE}:
             summary      = ((p.get("summary") or "").strip())
@@ -738,6 +972,24 @@ def _build_full_text(blocks_ordered: List[DocumentBlock]) -> str:
             text = (p.get("text") or "").strip()
             if text:
                 lines.append(f"_{text}_")
+            # Emit formulas referenced from this caption
+            for fid in sorted(
+                block.relations.get("embedded_formulas", []),
+                key=lambda fid: (
+                    block_map[fid].bbox.y1 if fid in block_map else 0,
+                    block_map[fid].bbox.x1 if fid in block_map else 0,
+                ),
+            ):
+                child = block_map.get(fid)
+                if not child:
+                    continue
+                fp = child.payload or {}
+                latex = (fp.get("latex") or "").strip()
+                meaning = (fp.get("meaning") or "").strip()
+                if latex:
+                    lines.append(f"  {{formula: {latex}}}")
+                    if meaning:
+                        lines.append(f"  [meaning: {meaning}]")
 
     return "\n".join(lines)
 
@@ -767,12 +1019,25 @@ def node_aggregate(state: AgentState) -> AgentState:
         }
         for b in ordered
         if b.parent_id is None
+        and b.detector_label != "aside_text"
+        and b.block_type not in {BlockType.HEADER, BlockType.FOOTER, BlockType.OTHER}
+        and not (
+            b.block_type == BlockType.TEXT
+            and len((b.payload.get("text") or "").strip()) < 3
+        )
     ]
 
     node_end(entry)
     finish_trace(trace)
-    logger.info("[aggregate] done - %d blocks, total pipeline %.2fs",
-                len(ordered), trace.get("total_duration_s", 0))
+
+    from .tracer import compute_metrics
+    metrics = compute_metrics(trace)
+
+    logger.info("[aggregate] done - %d blocks, %.0f tokens, $%.4f, total %.2fs",
+                len(ordered),
+                metrics.get("total_tokens", 0),
+                metrics.get("total_cost_usd", 0),
+                trace.get("total_duration_s", 0))
 
     output: Dict = {
         "run_id":     state.get("run_id"),
@@ -783,11 +1048,16 @@ def node_aggregate(state: AgentState) -> AgentState:
         "blocks":     [b.as_dict() for b in ordered],
         "full_text":  full_text,
         "reading_order": reading_order,
+        "metrics":    metrics,
         "summary": {
-            "num_pages":  len(state.get("page_sizes", [])),
-            "num_blocks": len(ordered),
-            "types":      type_counts,
-            "full_text_chars": len(full_text),
+            "num_pages":        len(state.get("page_sizes", [])),
+            "num_blocks":       len(ordered),
+            "types":            type_counts,
+            "full_text_chars":  len(full_text),
+            "total_duration_s": metrics.get("total_duration_s"),
+            "total_tokens":     metrics.get("total_tokens"),
+            "total_cost_usd":   metrics.get("total_cost_usd"),
+            "num_llm_calls":    metrics.get("num_llm_calls"),
         },
     }
     return {**state, "output": output, "status": "done", "_trace": trace}

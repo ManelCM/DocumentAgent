@@ -86,7 +86,10 @@ def get_layout_detector(warnings: List[str]):
         _LAYOUT_DETECTOR_LOADED = True
         try:
             from paddleocr import LayoutDetection
-            _LAYOUT_DETECTOR = LayoutDetection()
+            # enable_mkldnn=False: PaddlePaddle 3.x oneDNN backend raises
+            # NotImplementedError on some operators when PIR mode is active.
+            # Disabling oneDNN forces the plain CPU path, which is stable.
+            _LAYOUT_DETECTOR = LayoutDetection(enable_mkldnn=False)
         except Exception as exc:
             warnings.append(
                 f"LayoutDetection unavailable. Using page-level fallback. Details: {exc}"
@@ -123,8 +126,15 @@ def detect_layout_blocks(pages: List, warnings: List[str]) -> List[DocumentBlock
             )
             continue
 
-        result = detector.predict(img)
-        page_boxes = result[0].get("boxes", []) if result else []
+        try:
+            result = detector.predict(img)
+            page_boxes = result[0].get("boxes", []) if result else []
+        except Exception as exc:
+            warnings.append(
+                f"[detect_layout] predict() failed on page {page_idx}, "
+                f"using page fallback. Details: {exc}"
+            )
+            page_boxes = []
         if not page_boxes:
             block_num += 1
             blocks.append(
