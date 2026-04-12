@@ -766,7 +766,7 @@ def node_aggregate(state: AgentState) -> AgentState:
             "bbox":         {"x1": b.bbox.x1, "y1": b.bbox.y1, "x2": b.bbox.x2, "y2": b.bbox.y2},
         }
         for b in ordered
-        if not (b.skip_specialist and b.parent_id)
+        if b.parent_id is None
     ]
 
     node_end(entry)
