@@ -1,0 +1,1585 @@
+[PAGE 1]
+
+Hybrid Linear Attention Done Right:
+Efficient Distillation and Effective Architectures for Extremely Long Contexts
+Yingfa Chen”! Zhen Leng Thai’! Zihan Zhou? Zhu Zhang? Xingyu Shen '
+Shuo Wang! Chaojun Xiao! Xu Han! Zhivuan Liu!
+'NLP Group, DCST, IAI, BNRIST, Tsinghua University, Beijing, China ?OpenBMB
+{chenyingfal999, thaizhenleng123}@gmail.com
+wangshuo.thu@gmail.com, han-xu@tsinghua.edu.cn
+Abstract
+Hybrid Transformer architectures, which combine softmax attention blocks and recurrent neural networks (RNNs), have shown a desirable
+performance-throughput tradeoff for long-context
+modeling, but their adoption and studies are hindered by the prohibitive cost of large-scale pretraining from scratch. Some recent studies have
+shown that pre-trained softmax attention blocks
+can be converted into RNN blocks through parameter transfer and knowledge distillation. However, these transfer methods require substantial
+amounts of training data (more than 10B tokens),
+and the resulting hybrid models also exhibit poor
+long-context performance, which is the scenario
+where hybrid models enjoy significant inference
+speedups over Transformer-based models. In
+this paper, we present HALO (Hybrid Attention
+via Layer Optimization), a pipeline for distilling Transformer models into RNN-attention hybrid models. We then present HypeNet, a hybrid architecture with superior length generalization enabled by a novel position encoding scheme
+(named HyPE) and various architectural modifications. We convert the Qwen3 series into HypeNet
+using HALO, achieving performance comparable
+to the original Transformer models while enjoying
+superior long-context performance and efficiency.
+The conversion requires just 2.3B tokens, less
+than 0.01% of their pre-training data!.
+1. Introdnetion
+Transformer-based language models (Vaswani et al., 2017)
+rely on softmax attention blocks, which have a quadratic
+complexity with respect to the context length, making
+them prohibitively expensive for long contexts. In contrast, recurrent neural networks (RNNs) such as linear attention (Katharopoulos et al., 2020) and state space models (Gu
+& Dao, 2024) are much faster for long-context modeling due
+to their linear complexity. However, pure RNN models with
+fixed-size states generally underperform softmax attention.
+particularly on recall-intensive tasks (Jelassi et al., 2024;
+Yang et al., 2025b). To address this gap, there is a surge
+in interest in hybrid architectures that interleave attention
+and RNN layers’, achieving a favorable tradeoff between
+model performance and inference throughput (Lieber et al..
+2024; MiniMax et al., 2025; Qwen, 2025; Kimi et al., 2025;
+NVIDIA et al.. 2025).
+Hybrid architectures are typically pre-trained from scratch
+at a large scale (Qwen, 2025; NVIDIA et al., 2025), placing
+them beyond the reach of most academic research teams
+Hence, some works focus on distilling pre-trained Trans.
+former models into hybrid architectures (Gu et al., 2025:
+Hoshino et al., 2025; Wang et al., 2025b). These distil.
+lation methods use far fewer training tokens and produce
+hybrid models that are comparable to their Transformer
+counterparts on various common-sense reasoning (CSR)
+tasks. Although distilled hybrid models typically underperform those trained from scratch, they are valuable since they
+allow teams without resources to scale up pre-training to
+validate research ideas.
+However, these distillation methods still suffer from two
+critical limitations. (1) Most distillation methods still require tens to hundreds of billions of training tokens, which
+is still out of reach for most teams in academia. (2) While
+
+[PAGE 2]
+
+[CHART (line)]
+  Insight: HypeNet is more memory-efficient, faster, and better performing than Qwen3, especially at higher throughput and longer context lengths.
+  Trends: Qwen3 performance increases with memory, less memory-efficient than HypeNet; HypeNet shows better performance at lower memory, more memory-efficient; Qwen3 performance decreases with throughput, slower and worse; HypeNet performance decreases less with throughput, faster and better; Qwen3 time per output token increases sharply with context length; HypeNet time per output token increases more slowly with context length
+| Memory (GB) | Qwen3 Performance | HypeNet Performance |
+|-------------|-------------------|---------------------|
+| 8           | -                 | 56                  |
+| 16          | -                 | 64                  |
+| 24          | -                 | 70                  |
+| 32          | 48                | -                   |
+| 48          | 66                | -                   |
+| 56          | 70                | -                   |
+| 72          | 74                | -                   |
+
+| Throughput (tokens/s) | Qwen3 Performance | HypeNet Performance |
+|-----------------------|-------------------|---------------------|
+| 12                    | 74                | -                   |
+| 18                    | 67                | -                   |
+| 24                    | 58                | -                   |
+| 28                    | 48                | 70                  |
+| 38                    | -                 | 64                  |
+| 48                    | -                 | 56                  |
+
+| Context Length | Qwen3 Time (ms) | HypeNet Time (ms) |
+|----------------|-----------------|-------------------|
+| 1K             | 20              | 20                |
+| 256K           | 85              | 35                |
+| 512K           | 160             | 55                |
+| 1M             | -               | 103               |
+_Figure 1. Left & center: the performance-efficiency tradeoff of our model, HypeNet, versus the Qwen3 series, measured with 128K
+context length and BFloat16 precision. Right: the time per output token of the 1.7B models across different context lengths. For 1M
+
+context length, the Qwen3 model runs out of GPU memory. HypeNet is converted from Qwen3 using our distillation procedure, HALO
+and has better performance-efficiency tradeoff than Qwen3._
+the resulting hybrid models have short-context performance
+comparable to Transformer models, they exhibit severe performance degradation on long-context tasks, which is precisely the scenario where they are preferred over Transformer models.
+To address these challenges, we first propose HALO (Hybrid Attention via Layer Optimization), a novel crossarchitecture distillation procedure for converting pre-trained
+Transformer models into hybrid models. Notably, HALO involves an efficient attention layer selection method for determining which attention layers to keep unconverted to ensure
+the best long-context performance. Then, we propose Hybrid Position Encoding (HyPE), a position encoding scheme
+with strong length generalization, specifically designed for
+hybrid architectures. In addition to HyPE, we propose a
+series of architectural improvements, validated with careful
+ablation experiments on models with over 1B parameters
+The combination of these improvements results in HypeNet.
+a series of hybrid models converted from the Qwen3 series, with a much better performance-throughput tradeoff.
+as shown in Figure 1.
+Our contributions can be summarized as follow:
+* We develop a novel cross-architecture distillation procedure that converts Transformer models into attentionRNN hybrid models using fewer than 3B tokens.
+thereby significantly improving the model’s efficiency
+in long-context scenarios.
+¢« We present HyPE, a novel position-encoding
+scheme that combines RoPE (Su et al., 2023) and
+NoPE (Kazemnejad et al., 2023), designed for hybrid
+models. Coupled with an attention scaling mechanism.
+HyPE achieves superior leneth generalization.
+¢ Based on HyPE, we propose HypeNet, a novel hybrid
+architecture that incorporates multiple architectural improvements when converting from a pre-trained Transformer model.
+_Table 1. Existing attention-to-hybrid distillation methods and thei
+release date and training tokens required._
+[TABLE: The table compares different methods by their release date and the number of tokens used.]
+| Method | Date | Tokens |
+| --- | --- | --- |
+| Mamba-in-the-Llama (Wang et al.) | Aug. 2024 | 20B |
+| SMART (Yang et al.) | May 2025 | >7B |
+| RAD (Hoshino et al.) | May 2025 | 20B |
+| Jet-Nemotron (Gu et al.) | Aug. 2025 | 400B |
+| KL-LS (Li et al.) | Dec. 2025 | 25B |
+| HALO (ours) | Jan. 2026 | 2.3B |
+9. Related Works
+RNN-Attention Hybrid Models State-of-the-art hybrid
+models with up to hundreds of billions of parameters have
+exhibited performance comparable to standard Transform.
+ers on both commonsense reasoning and recall-intensive
+tasks (e.g., needle-in-a-haystack (NIAH) (Hsieh et al.
+2024)) while being more efficient for processing long contexts (Lieber et al., 2024; MiniMax et al., 2025; Qwen, 2025;
+Kimi et al., 2025; NVIDIA et al., 2025). Despite their impressive performance, there are rather few publicly available
+hybrid models with frontier-level performance, because pretraining from scratch is prohibitively expensive for most
+teams. To avoid this training cost, we focus on distilling
+pre-trained Transformer models into hybrid models.
+Position Encoding in Hybrid Models Current, RoPE (Su
+et al., 2023) has become the de facto standard position encoding (PE) for Transformer models (Yang et al., 2025a:
+Grattafiori et al., 2024). On the other hand, RNNs usually
+encode positional information through decay/transition matrices, and do not employ RoPE (Dao & Gu, 2024; Yang
+et al., 2025b). This has remained the case for hybrid models.
+which means attention layers adopt RoPE while RNN layers do not (i.e., RNNs use NoPE) (Qwen, 2025; MiniMax
+et al., 2025). Recently, SWAN-GPT (Puvvada et al., 2025)
+has shown promising long-context generalization by combining RoPE in sliding window attention layers and NoPE
+in full attention layers, but it is not a hybrid model. Concurrent to this paper, Kimi-Linear (Kimi et al., 2025) has
+
+[PAGE 3]
+
+adopted NoPE in both attention and RNN layers. In contrast
+our model employs a novel PE scheme and achieves better
+long-context performance than typical PE methods found in
+existing hybrid models.
+Distilling Transformers into Hybrid Models Many
+works focus on converting Transformers into pure RNN
+models via distillation (Kasai et al., 2021; Bick et al., 2025:
+Zhang et al., 2025; Goldstein et al., 2025), but converting
+Transformers into hybrid models remains underexplored
+When distilling into hybrids, choosing which attention layet
+to convert to RNN is critical for maintaining performance
+especially for tasks that are hard to handle with RNN layers
+Wang et al. (2025b) adopt a simple pipeline and attention
+layer selection scheme and show severe performance degra.
+dation. More recent works choose which attention layers to
+retain more sophistically. Yang et al. (2026) use the output
+distribution shift when replacing an attention layer with an
+RNN layer to determine the importance of attention layers. Hoshino et al. (2025) propose a redundancy metric
+for determining importance, and Gu et al. (2025) rely on
+the performance drop on certain tasks. Finally, KL-guided
+layer selection (KL-LS) (Li et al., 2025), a concurrent work
+proposes using KL-divergence from the teacher model as
+the importance metric and requires a thorough search that
+repeatedly reruns a distillation process for every layer.
+Table | lists previous distillation works. These works typically use more than 10B training tokens and have poor recall
+performance compared to Transformer models, especially
+on long contexts. In contrast, our distillation procedure
+requires just 2.3B tokens, and our architecture has much
+stronger long-context performance thanks to its superior
+leneth generalization.
+Notations All models involved in this study, including
+both Transformer and hybrid models, consist of a stack of
+L layers. and the /-th layer can be formalized as
+$$
+\[
+\mathbf{H}^{(l)} = \text{Mixer}^{(l)}\left(\mathbf{X}^{(l-1)}\right) + \mathbf{X}^{(l-1)}, \\
+\mathbf{X}^{(l)} = \text{MLP}^{(l)}\left(\mathbf{H}^{(l)}\right) + \mathbf{H}^{(l)},
+\]
+$$
+  [update_rule: This formula describes the update steps in a neural network layer where the input representation is first processed by a Mixer function with a residual connection, producing an intermediate representation, which is then processed by an MLP with another residual connection to produce the output representation for the current layer.]
+where X = [x],--- xP] € R?*¢ denotes the T
+d-dimensional output embeddings. In an RNN-attention
+hybrid model, the set of attention layers is specified by
+Latin © {latn,: | i= 1,-++ , Lan}, where Lat is the number
+of attention layers and latin,; € {1,--- , L} is the index of
+the 7-th attention laver. The mixers are defined as
+  {formula: \[ \mathbf{X}^{(l)} = \left[ \mathbf{x}_1^{\top}, \ldots, \mathbf{x}_T^{\top} \right]^{\top} \in \mathbb{R}^{T \times d} \]}
+  [meaning: This formula defines the matrix \mathbf{X}^{(l)} at layer l as the vertical concatenation of the transposed vectors \mathbf{x}_1 through \mathbf{x}_T, resulting in a matrix of size T by d.]
+  {formula: \[ L_{\text{attn}} \in \{ l_{\text{attn}, i} \mid i = 1, \cdots, L_{\text{attn}} \} \]}
+  [meaning: This formula defines the set L_attn as containing elements l_attn,i indexed from 1 to L_attn.]
+  {formula: \[ \mathcal{L}_{\text{attn}} \]}
+  [meaning: This symbol represents the attention loss, a loss function used to train models with attention mechanisms by measuring the discrepancy between predicted and target attention distributions.]
+  {formula: $l_{attn,i} \in \{1, \cdots, L\}$}
+  [meaning: The attention label for the i-th element is an integer between 1 and L inclusive.]
+$$
+\[ \text{Mixer}^{(l)} = \begin{cases} \text{ATTN}^{(l)} & \text{if } l \in \mathcal{I}_{\text{attn}}, \\ \text{RNN}^{(l)} & \text{otherwise}. \end{cases} \]
+$$
+  [definition: Defines the Mixer at layer l as either an attention module if l is in the set of attention layers, or as an RNN module otherwise.]
+Softmax Attention Layers In Transformer, the mixet
+laver uses softmax attention, which can be written as°*
+$$
+\[ \mathbf{Q} = \mathbf{X}\mathbf{W}_q, \quad \mathbf{K} = \mathbf{X}\mathbf{W}_k, \quad \mathbf{V} = \mathbf{X}\mathbf{W}_v, \quad \mathbf{Y} = \mathrm{softmax}\left( \frac{1}{\sqrt{d_h}} \mathbf{Q}\mathbf{K}^\top \odot \mathbf{M} \right) \mathbf{V}\mathbf{W}_o^\top \]
+$$
+  [definition: This formula defines the masked scaled dot-product attention mechanism used in transformer models, where queries, keys, and values are computed from the input, a mask is applied to the scaled dot product of queries and keys, and the result is used to weight the values before a final linear transformation.]
+where W,, W;,, W,, W, € R?*“ are learnable param.
+eters, and M is the attention mask. We use row-vector
+representation, so x! x denotes an outer product.
+  {formula: $\mathbf{W}_q, \mathbf{W}_k, \mathbf{W}_v, \mathbf{W}_o \in \mathbb{R}^{d \times d_h}$}
+  [meaning: This formula defines that the weight matrices for query, key, value, and output in a model are real-valued matrices with dimensions d by d_h.]
+  {formula: $\mathbf{S} = \mathbf{x} \mathbf{x}^\top$}
+  [meaning: This formula defines the matrix \mathbf{S} as the outer product of the vector \mathbf{x} with its transpose, resulting in a square matrix.]
+Modern RNN Layers There are many variants of RNN
+layers. but we focus on RNNs that can be written as
+$$
+\[ \mathbf{q}_t = \mathbf{x}_t \mathbf{W}_q, \quad \mathbf{k}_t = \mathbf{x}_t \mathbf{W}_k, \quad \mathbf{v}_t = \mathbf{x}_t \mathbf{W}_v, \]
+$$
+  [definition: This formula defines how the input vector at time t is linearly transformed into query, key, and value vectors using respective weight matrices, commonly used in attention mechanisms.]
+$$
+\[ \mathbf{S}_t = \mathbf{F}_t \mathbf{S}_{t-1} + \mathbf{k}_t^{\top} \mathbf{v}_t \in \mathbb{R}^{d_h \times d_h}, \]
+$$
+  [update_rule: This formula updates the state matrix at time t by applying a linear transformation to the previous state and adding the outer product of the key and value vectors, resulting in a new state matrix of dimension d_h by d_h.]
+$$
+\[ \mathbf{y}_t = \mathbf{q}_t \mathbf{S}_t \mathbf{W}_o^{\top} \in \mathbb{R}^d, \]
+$$
+  [definition: This formula defines the output vector at time t as the product of the query vector, a state matrix, and the transpose of an output weight matrix, resulting in a d-dimensional vector.]
+where F, € R%*¢ is named the transition matrix and
+is a function of x,;. The above formulas include state-of.
+the-art RNN variants such as Mamba2 (Dao & Gu, 2024)
+Gated DeltaNet (Yang et al., 2025b), etc. To enable fast
+parallelization, F, is typically a diagonal matrix or rank-1
+matrix (Yang et al., 2024; 2025b). S; is named the recurrent
+state*, and Eq. (5) and (6) are named the update rule and
+the guery rule, respectively.
+  {formula: $\mathbf{F}_t \in \mathbb{R}^{d_h \times d_h}$}
+  [meaning: The matrix \( \mathbf{F}_t \) is defined as a real-valued matrix with dimensions \( d_h \times d_h \).]
+  {formula: $X_t$}
+  [meaning: Represents the value of variable X at a specific time t.]
+  {formula: $F_t$}
+  [meaning: Represents a quantity or function F evaluated at time or index t.]
+  {formula: $S_t$}
+  [meaning: Represents a variable or state indexed by time t]
+3.1. The Impact of Attention Layer Selection when
+Distillins Transformers into Hvbrids
+When distilling Transformer models into hybrid models, one
+important question is how to select which attention layers
+to remain unconverted, i.e., how to determine the optimal
+Tain for maximizing model performance, without increasing
+the number of attention layers |Zaun| (since efficiency is
+negatively correlated with |Zatn|). Previous works have
+identified that RNN models underperform attention models
+on recall-intensive tasks (Yang et al., 2025b; Shen et al.
+2025; Jelassi et al., 2024); thus, our objective is to identify
+which attention layers are most important for modeling
+recall abilities and leave them unconverted.
+  {formula: $L_{\text{attn}}$}
+  [meaning: This symbol represents the attention loss, typically used in machine learning models involving attention mechanisms to quantify the error or difference related to attention weights.]
+  {formula: $\left| I_{attn} \right|$}
+  [meaning: The formula represents the magnitude or absolute value of the attention map or attention intensity.]
+  {formula: $\left| \mathcal{I}_{\text{attn}} \right|$}
+  [meaning: This formula represents the size or number of elements in the attention set \( \mathcal{I}_{\text{attn}} \).]
+3.2. The Importance of Position Encoding for Language
+Modeling and Lensth Generalization
+For attention-based models, it is common to inject positional information into the model via RoPE, which applies a position-dependent rotation to Q and K. Although
+RoPE typically improves language modeling performance of
+Transformer models, attention without RoPE (a.k.a., NoPE).
+exhibits superior training-free length generalization (Kazemnejad et al., 2023: Wang et al.. 2024: Puvvada et al., 2025)
+
+[PAGE 4]
+
+[IMAGE: The image compares three methods (Jet-Nemotron, KL-Guided Layer Selection, HALO) for model training stages, showing their workflows, stages, and token usage with corresponding money icons.]
+  Visible text: Jet-Nemotron (Gu et al., 2025)
+Hidden state alignment
+Layer selection
+Finetuning
+Stage 1
+Stage 2
+400B tokens
+KL-Guided Layer Selection (Li et al., 2025)
+Attn. weight transfer
+Hidden state alignment
+Distillation
+Layer selection
+Distillation
+repeat L times
+Initialization
+Stage 1
+Stage 2
+Stage 2 (again)
+25B tokens
+HALO (ours)
+Attn. weight transfer
+Hidden state alignment
+Layer selection
+Distillation
+Finetuning
+Initialization
+Stage 1
+Stage 2
+Stage 3
+2.3B tokens
+  Key elements: Three method names with citations: Jet-Nemotron (Gu et al., 2025), KL-Guided Layer Selection (Li et al., 2025), HALO (ours), Boxes representing stages: Attn. weight transfer, Hidden state alignment, Layer selection, Distillation, Finetuning, Arrows indicating process flow between stages, Annotations for stages: Initialization, Stage 1, Stage 2, Stage 3, Repeat L times annotation for KL-Guided Layer Selection, Money icons representing token amounts, Token counts with colors and values: 400B tokens (red), 25B tokens (orange), 2.3B tokens (green)
+_Figure 2. Various pipelines for converting Transformer models into hybrid models. The boxes with dotted lines represent training-fre«
+stages, while those with solid lines represent training stages. HALO is much more data-efficient than prior methods._
+Length generalization is also important for long-context
+post-training because models with better length generalization are more data-efficient (Peng et al., 2023).
+In contrast, RNNs are inherently position-aware through
+the state transition F’, in their update rule. Therefore, most
+existing RNN models employ NoPE. However, the language
+modeling performance and length generalization of RNNs
+are sensitive to the structure and parameterization of the
+update rule (Chen et al., 2025b; Yang et al., 2024). Thus
+in hybrid models, achieving strong performance and length
+generalization requires careful synergy between the update
+rule (and/or PE) RNN layers and the PE in attention layers
+  {formula: $F_t$}
+  [meaning: Represents a quantity or function evaluated at time or index t]
+4. HALO: An Efficient Pipeline to Distill
+Transformers into Hvbrids
+Our conversion procedure, HALO, is an adoption and improvement of RADLADS (Goldstein et al., 2025), a distillation method that converts Transformer models into
+pure RNN models (Peng et al., 2025). Figure 2 shows
+an overview of HALO. It consists of an attention weight
+transfer process, three training stages, and an attention layer
+selection process. Appendix B shows the training configuration of each stage in HALO.
+4.1. Initialization Stage: Attention Weight Transfer
+Given a Transformer model consisting entirely of attention layers, for each attention layer ATTN“)(.)
+we use its configuration and pre-trained projection
+weights (W,, Wx, W,, W.) to instantiate an RNN layer
+RNN)(.). If an RNN layer has other modules that cannot be covered by the weights of the attention layer, we
+initialize the weights of these modules using the empirical
+implementation of RNN layers.
+  {formula: $\mathrm{ATTN}^{(l)}(\cdot)$}
+  [meaning: This notation defines the attention function at layer l, which takes an input and computes the attention output.]
+  {formula: $(\mathbf{W}_q, \mathbf{W}_k, \mathbf{W}_v, \mathbf{W}_o)$}
+  [meaning: This tuple represents the set of learned weight matrices used in the attention mechanism of a transformer model.]
+  {formula: $\mathrm{RNN}^{(l)}(\cdot)$}
+  [meaning: This notation represents the function of a recurrent neural network at layer l, taking some input.]
+4.2. Stage 1: Hidden State Alignment
+We train each instantiated RNN layer independently by min
+imizing the mean squared error (MSE) between its output
+hidden states and the attention laver used to instantiate it:
+\mathcal{L}_{stage 1}^{(l)} = \mathrm{MSE} \left( \mathbf{Y}_{teacher}^{(l)}, \mathrm{RNN}^{(l)} \left( \mathbf{X}^{(l-1)} \right) \right), \quad (7)
+where YO ver is the output of the /-th attention layer in the
+attention-only teacher model. During the alignment process
+only the RNN layers are trained, and all other weights are
+frozen. After stage 1, each attention layer has a student
+RNN layer that can potentially replace it.
+  {formula: $\mathbf{Y}_{\text{teacher}}^{(l)}$}
+  [meaning: Represents the output or target matrix from the teacher model at layer l.]
+4.3. Attention Laver Selection
+Here, we perform attention layer selection to determine Zattn
+We propose to select attention layers that, when replaced by
+RNN layers, exhibit a large drop in recall performance
+and a small drop in CSR. Let © denote the original
+model but with the i-th layer replaced with the corresponding RNN layer from stage 1. Let R(M),C(M) € [0,1]
+denote the recall and CSR performance of the model M.
+then, the importance score of each attention layer is
+  {formula: $L_{attn}$}
+  [meaning: This symbol represents the attention loss, a component used in training models with attention mechanisms.]
+  {formula: $M^{(i)}$}
+  [meaning: Represents the i-th instance or element of the matrix or object M]
+  {formula: $\mathcal{R}(M), \mathcal{C}(M) \in [0,1]$}
+  [meaning: The values of the functions R and C applied to M are constrained to lie within the interval from 0 to 1.]
+$$
+\[ s_i = \frac{\max_i \left[ \mathcal{R} \left( M^{(i)} \right) \right] - \mathcal{R} \left( M^{(i)} \right)}{\max_i \left[ \mathcal{C} \left( M^{(i)} \right) \right] - \mathcal{C} \left( M^{(i)} \right) + \epsilon} , \]
+$$
+  [definition: This formula defines a score s_i for the i-th element by normalizing the difference between the maximum and current values of a reward function R over the maximum and current values of a cost function C, with a small epsilon added to the denominator to prevent division by zero.]
+where ¢« = 10~® is a small constant to avoid division by
+zero. Finally, we simply pick the Top-k most important
+attention laver as
+  {formula: $\epsilon = 10^{-6}$}
+  [meaning: This formula defines epsilon as a very small positive number, specifically one millionth.]
+$$
+\[ I_{\text{attn}} = \operatorname{Top}\text{-}k(s_i). \]
+$$
+  [definition: This formula defines the set of indices corresponding to the top k attention scores from the set of scores s_i.]
+Based on Wang et al. (2025a), we always use k = |L/4] ir
+this paper, which means that 25% of the layers in the final
+model are attention layers. The actual layer indices Tati
+selected by our approach are reported in Appendix C.
+  {formula: $k = \left\lfloor \frac{L}{4} \right\rfloor$}
+  [meaning: This formula defines the variable k as the integer part of one-fourth of L.]
+  {formula: $\mathcal{L}_{\text{attr}}$}
+  [meaning: This symbol represents an attribute-related loss function, typically used to measure the error or difference related to attributes in a model.]
+
+[PAGE 5]
+
+[IMAGE: The image compares two neural network architectures, one using an RNN mixer and the other using softmax attention, showing their components and data flow.]
+  Visible text: Linear
+RNN mixer
+RoPE
+q_t
+Norm
+Linear
+RoPE
+k_t
+Norm
+Linear
+v_t
+Linear
+Linear
+s_(t-1)
+s_t
+o_t
+Output
+FFN
+Attention layer
+FFN
+RNN layer
+Input
+Linear
+Softmax attention
+Scale
+q_t
+k_t
+v_t
+Linear
+Linear
+Linear
+Linear
+z_t
+  Key elements: RNN mixer block with Linear, Norm, RoPE, and RNN mixer components, Softmax attention block with Linear, Scale, and Softmax attention components, Arrows indicating data flow between components, Labels for variables: q_t, k_t, v_t, z_t, s_t, s_(t-1), o_t, Numbered annotations (1, 2, 3, 4) marking specific parts, Central block showing FFN, Attention layer, and RNN layer, Dashed and solid arrows connecting blocks
+_Figure 3. Illustration of HypeNet. The architectural modifications introduced during HALO are marked with ®, @, ®, and @. Red dottec
+lines indicate components that are removed during HALO, black dotted lines indicate components that are added._
+4.4. Stage 2: Knowledse Distillation
+In stage 2, we construct the final hybrid model fhypria using
+Tattn and conduct standard end-to-end knowledge distillation
+with the original Transformer model fog as the teacher
+and the hybrid model as the student. The objective can be
+formulated as
+  {formula: $f_{\text{hybrid}}$}
+  [meaning: Represents a hybrid function or hybrid frequency, typically combining multiple components or methods.]
+  {formula: $L_{att}$}
+  [meaning: This symbol represents the attention loss, typically used in machine learning models involving attention mechanisms.]
+  {formula: \[ f_{\text{orig}} \]}
+  [meaning: This formula represents the original function or original value denoted by f with a subscript 'orig'.]
+$$
+\[ \mathcal{L}_{stage\ 2} = D_{KL} \big( f_{orig}(\mathbf{X}) \| f_{hybrid}(\mathbf{X}) \big), \]
+$$
+  [loss_function: This formula defines a loss function at stage 2 as the Kullback-Leibler divergence between the output distributions of the original model and a hybrid model, both evaluated on the same input data.]
+where Dx, is KL divergence. The teacher model weights are
+frozen in this stage. We use 1B training data for knowledge
+distillation, and adopt a cosine learning rate (LR) scheduler
+that decays from Tstager to le-5, where 7stager is determined
+by a separate hyperparameter search for each model size
+The effectiveness of this distillation setting is validated in
+Appendix F.1.1.
+  {formula: $D_{KL}$}
+  [meaning: Represents the Kullback-Leibler divergence, a measure of how one probability distribution diverges from a second, expected probability distribution.]
+  {formula: $\eta_{\text{stage2}}$}
+  [meaning: Represents the learning rate or a parameter specific to the second stage of a process or algorithm.]
+  {formula: $\eta_{\text{stage2}}$}
+  [meaning: Represents the learning rate or a parameter specific to the second stage of a process or algorithm.]
+4.5. Stage 3: Finetuning
+Finally, to optimize the hybrid model’s capabilities, we
+finetune the hybrid model with greater context length and
+a smaller learning rate. We use 1B training data for long.
+context finetuning.
+5. HypeNet: An Effective Attention-RNN
+Hvbrid Architecture
+HypeNet is illustrated in Figure 3. It incorporates a novel
+PE scheme called HyPE (described in Section 5.1) and some
+other architectural modifications (described in Section 5.2)
+These architectural improvements are agnostic to the RNN
+mixer. Therefore, HypeNet is compatible with most modern
+RNNs (see Section 5.3 for details). A complete formulation
+of HypeNet can be found in Appendix A.
+5.1. HvPE: Hvbrid Positional Encoding (@)
+In brief, HyPE applies RoPE in RNN layers and NoPE in attention layers. This scheme allows the model to combine the
+length generalization power of NoPE and the rich positional
+information of RoPE, getting the best of both worlds.
+Motivation HyPE is motivated by the finding that RNNs
+have a limited “receptive field”, which means they struggle
+to model long-context dependencies (Chen et al., 2025b)
+This implies that in hybrid models, RNN layers primarily
+model short-distance dependencies while attention layers
+model long-distance dependencies. Therefore, when the
+context length exceeds the RNNs’ receptive field, RNN layers are agnostic to the context length, implying that length
+generalization is unaffected by these layers. Consequently.
+the model’s length generalization depends only on attention layers, which use NoPE, allowing it to generalize well
+beyond its training context length. In the meantime, RNN
+layers with RoPE provide rich positional information, allowing the model to outperform a NoPE-only model.
+Attention Logits Scaling As the context length increases
+the entropy of attention scores increases, resulting in poor
+length generalization. To mitigate this, we adopt the dynamic attention scaling from Puvvada et al. (2025), where
+the attention logits are scaled with a position-dependent
+scaling factor s; during inference:
+$$
+\[ \text{softmax}\left( \frac{s_t \mathbf{q}_t \mathbf{K}}{\sqrt{d_h}} \right), \quad s_t = \log_a (t + a), \]
+$$
+  [definition: This formula defines a scaled softmax attention mechanism where the input to the softmax is scaled by a time-dependent factor s_t, which is a logarithmic function of the time step t plus a constant a. The scaling normalizes the dot product of the query vector and key matrix by the square root of the hidden dimension.]
+where a is a hyperparameter determined after training by
+minimizing loss on a set of pre-training documents. The
+actual value of each model is reported in Appendix C. This
+scaling can be applied prior to the attention operator. Therefore, it has a negligible effect on the runtime. The effective:
+ness of this scaling mechanism is validated in Appendix F.1
+Conversion Details When applying HALO to pre-trained
+checkpoints, attention layers are not trained/modified during
+stage 1. Therefore. the removal of RoPE in attention layers
+
+[PAGE 6]
+
+occurs at the start of stage 2, when we instantiate the final
+hybrid model.
+59. Other Architectural Modifications
+In addition to HyPE, we make the following architectural
+modifications (marked with @, ®, and @ in Figure 3) to
+further boost the performance and length generalization.
+QK-Normalization (@) Proposed by Henry et al. (2020).
+this normalizes q; and k;:
+$$
+$\mathbf{q}_t = \mathrm{Norm}(\mathbf{x}_t \mathbf{W}_q), \quad \mathbf{k}_t = \mathrm{Norm}(\mathbf{x}_t \mathbf{W}_k)$
+$$
+  [definition: This formula defines the query and key vectors at time t by applying linear transformations to the input vector followed by a normalization step.]
+This has been adopted by some open-source Transformer
+LLMs (e.g., Qwen3 and Gemma3 (Gemma et al., 2025)).
+but is not usually used in RNN layers. However, we find that
+adding them in RNN layers improves the hybrid model’s
+performance. Thus, when converting models without QKnormalization. we add OK-normalization to the RNN laver
+GQA to MHA (©) Most Transformer models employ
+grouped-query attention (GQA) (Ainslie et al., 2023), where
+groups of attention heads share the same set of KVs, reduc:
+ing KV cache size. However, RNN layers do not have a
+KV cache, and sharing KVs may reduce the expressivity
+of RNN layers. Thus, when initializing RNN layers before
+stage 1, we decouple KV heads by cloning the attention KV
+projection weights:
+W_{\square}^{(i)} \leftarrow W_{\square}^{(\lfloor i/g \rfloor)}, \forall i \in \{1, \cdots, n_h\}, \square \in \{k, v\} \quad (13)
+where g is the query group size and wey is the KV projection weights for the 7-th head.
+  {formula: $\mathbf{W}^{(i)}$}
+  [meaning: Represents the weight matrix at the i-th layer or iteration in a model or algorithm.]
+Output Gate (@) Many recurrent architectures (Dao &
+Gu, 2024; Yang et al., 2025b) have an output gate, a datadependent element-wise gating mechanism prior to the output projection:
+$$
+\[ \mathbf{o}_t = \text{Mixer}(\mathbf{x}_t), \quad \mathbf{z}_t = \sigma(\mathbf{x}_t \mathbf{W}_z), \quad \mathbf{y}_t = (\text{Norm}(\mathbf{o}_t) \odot \mathbf{z}_t) \mathbf{W}_o^{\top}, \]
+$$
+  [update_rule: This formula describes a step in a neural network layer where the input vector \mathbf{x}_t is processed by a Mixer function, gated by a sigmoid-activated linear transformation, normalized, combined element-wise with the gate, and then linearly transformed to produce the output \mathbf{y}_t.]
+where o is an activation function, and W, € R27 is learnable parameters. We found that adding this component
+during conversion gives consistent performance gains with
+little increase in inference costs. Hence, during initialization.
+we add this mechanism by randomly initializing W
+  {formula: $\mathbf{W}_z \in \mathbb{R}^{d \times d}$}
+  [meaning: This formula defines \( \mathbf{W}_z \) as a real-valued square matrix of dimension \( d \times d \).]
+Qiu et al. (2025) have shown that adding an output gate
+to softmax attention improves model quality and length
+generalization. Thus, we also add a randomly initialized
+output gate to attention layers, but at the start of stage 2
+instead of stage 1, since attention layers are not trained in
+stage 1.
+Increased Model Size Due to the introduction of ® and
+@, HypeNet is roughly 10% larger than the model it is
+distilled from. However, according to Chen et al. (2025a)
+increasing model size while reducing the KV size is more
+cost-effective in long-context scenarios. HypeNet is much
+more efficient than the base model, due to a much smaller
+KV cache despite having slightly more parameters.
+5 3% RNN Mixer
+HypeNet is agnostic to the RNN mixer as long as it takes
+QKV as the input. Thus, HypeNet can flexibly adopt any of
+the modern RNN mixers, including Lightning attention (Qin
+et al., 2024a), Mamba2 (Dao & Gu, 2024), GLA (Yang
+et al., 2024), GDN (Yang et al., 2025b), and RWKV-7 (Peng
+et al., 2025) (see Appendix G for which RNN mixers are
+compatible). We tried to convert Qwen3-1.7B with each
+mixer and concluded that Lightning Attention provides the
+best balance between CSR and length generalization. The
+ablation results are reported in Section 6.3.
+6. Experiments
+We first describe our experimental setup (Section 6.1). Then
+we compare HypeNet + HALO against Qwen3 and stateof-the-art hybrids that are also converted from pre-trained
+models (Section 6.2). Then, we verify the effectiveness of
+various design choices in HypeNet (Section 6.3). After.
+wards, we present ablation studies for HALO’s architectural
+modifications (Section 6.4) and attention layer selection
+method (Section 6.5). Finally, we analyze the inference
+efficiency of HypeNet (Section 6.6).
+6.1. Experimental Setup
+Models We apply HALO to the 1.7B, 4B, and 8B model:
+of Qwen3 (Yang et al., 2025a), which is one of the most
+widely-used open-source language model series.
+Training Configurations In HALO, we use FineWebedu (Penedo et al., 2024) for training. It is a popular opensource, high-quality Internet-scale pre-training corpus. All
+data are randomly sampled from the 10B subset. The concrete hyperparameters that we use for each stage in HALO
+are reported in Appendix B.
+Evaluation We mainly evaluate CSR and long-context
+recall performance. For CSR, we use a suite of zero-shot
+downstream tasks that are common in related literature. To
+measure long-context performance, we report accuracy on
+NIAH>. More details are given in Appendix E.2.
+
+[PAGE 7]
+
+_Table 2. Long-context recall performance of HypeNet + HALO versus state-of-the-art hybrid models that are distilled from pre-trained
+Transformer models. Owen3 is evaluated with YaRN. as suggested by its authors. Best scores are bolded._
+[TABLE: The table compares performance metrics of different models across three NIAH-Single datasets at varying token lengths (32K, 64K, 128K, 256K).]
+| Model | Param | Token | NIAH-Single-1 32K | NIAH-Single-1 64K | NIAH-Single-1 128K | NIAH-Single-1 256K | NIAH-Single-2 32K | NIAH-Single-2 64K | NIAH-Single-2 128K | NIAH-Single-2 256K | NIAH-Single-3 32K | NIAH-Single-3 64K | NIAH-Single-3 128K | NIAH-Single-3 256K |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3 (teacher, no RNNs) | 1.7B | - | 100 | 100 | 96.4 | 17.0 | 100 | 98.8 | 24.8 | 19.2 | 100 | 98.4 | 14.8 | 19.0 |
+| Jet-Nemotron (Gu et al., 2025) | 2B | 400B | 99.8 | 56.0 | 0.0 | 0.0 | 94.2 | 65.0 | 0.0 | 0.0 | 84.0 | 15.4 | 0.0 | 0.0 |
+| KL-LS (GDN) (Li et al., 2025) | 3B | 25B | 99.8 | 99.4 | 68.4 | 14.8 | 99.4 | 49.6 | 28.2 | 10.4 | 99.0 | 51.0 | 24.8 | 11.0 |
+| HypeNet + HALO (ours) | 2B | 2.3B | 99.8 | 99.6 | 99.8 | 99.8 | 95.2 | 99.6 | 97.8 | 86.2 | 87.2 | 72.6 | 44.8 | 48.8 |
+[CHART (line)]
+  Insight: HypeNet maintains perfect accuracy across all evaluation context lengths, while other models sharply decline after 4K.
+  Trends: Most series show high accuracy at low eval context lengths (512 to 4K); Sharp drop in accuracy for Transformer (RoPE), YaRN, and SWAN-GPT after 4K eval context length; HypeNet maintains near 100% accuracy across all eval context lengths; All NoPE and All RoPE series show a sharp drop after 4K but maintain slightly higher accuracy than Transformer and YaRN at longer lengths; RNN NoPE + Attn RoPE shows consistently low accuracy across all eval context lengths
+| Eval. context Length | Transformer (RoPE) | YaRN | SWAN-GPT | HypeNet | All NoPE | All RoPE | RNN NoPE + Attn RoPE |
+|----------------------|-------------------|------|----------|---------|----------|----------|---------------------|
+| 512                  | ~95               | ~95  | ~85      | 100     | 100      | 100      | ~0                  |
+| 1K                   | ~90               | ~90  | ~80      | 100     | 100      | 100      | ~0                  |
+| 2K                   | ~85               | ~85  | ~75      | 100     | 100      | 100      | ~0                  |
+| 4K                   | ~80               | ~80  | ~70      | 100     | 100      | 100      | ~0                  |
+| 8K                   | ~0                | ~0   | ~0       | 100     | ~0       | ~0       | ~0                  |
+| 16K                  | ~0                | ~0   | ~0       | 100     | ~0       | ~0       | ~0                  |
+| 32K                  | ~0                | ~0   | ~0       | 100     | ~0       | ~0       | ~0                  |
+| 64K                  | ~0                | ~0   | ~0       | 100     | ~0       | ~0       | ~0                  |
+| 128K                 | ~0                | ~0   | ~0       | 100     | ~0       | ~0       | ~0                  |
+| 256K                 | ~0                | ~0   | ~0       | 100     | ~0       | ~0       | ~0                  |
+_Figure 4. NIAH scores of HypeNet variants based on different
+position encodings, as a function of context length. The models
+are trained from scratch with 20B tokens and 500M parameters._
+[CHART (line)]
+  Insight: HypeNet-Lightning consistently maintains near-perfect accuracy across all evaluation context lengths, outperforming all other models which degrade significantly beyond 4K context length.
+  Trends: Transformer (RoPE) accuracy drops sharply after 4K context length; HypeNet-GLA, HypeNet-Mamba2, HypeNet-GDN, and HypeNet-RWKV7 show decreasing accuracy with increasing context length beyond 4K; HypeNet-Lightning maintains near 100% accuracy across all context lengths; Most models peak or maintain high accuracy up to 4K context length
+| Eval. context Length | Transformer (RoPE) | HypeNet-GLA | HypeNet-Mamba2 | HypeNet-GDN | HypeNet-RWKV7 | HypeNet-Lightning |
+|----------------------|-------------------|-------------|----------------|-------------|---------------|-------------------|
+| 512                  | 100               | 100         | 100            | 100         | 100           | 100               |
+| 1K                   | 100               | 100         | 100            | 100         | 100           | 100               |
+| 2K                   | 100               | 100         | 100            | 100         | 100           | 100               |
+| 4K                   | 100               | 100         | 100            | 100         | 100           | 100               |
+| 8K                   | 0                 | ~80         | ~90            | ~90         | 0             | 98                |
+| 16K                  | 0                 | ~30         | ~40            | ~50         | 0             | 97                |
+| 32K                  | 0                 | ~20         | ~30            | ~40         | 0             | 98                |
+| 64K                  | 0                 | ~10         | ~20            | ~30         | 0             | 97                |
+| 128K                 | 0                 | ~10         | ~20            | ~30         | 0             | 97                |
+| 256K                 | 0                 | ~10         | ~20            | ~30         | 0             | 97                |
+_Figure 5. NIAH scores of HypeNet variants based on different
+RNN mixers, as a function of context length. The models are
+trained from scratch with 20B tokens and 500M parameters._
+Evaluation Data for Layer Selection Our layer selection
+method relies on measuring the performance change in CSR
+and recall (see Eq. (8)). Inspired by Gu et al. (2025), we use
+the normalized accuracy on HellaSwag (Zellers et al., 2019)
+ARC-Easy, and ARC-Challenge (Clark et al., 2018) as the
+CSR performance, the average score on SQUAD (Rajpurkat
+et al., 2016), FDA (Arora et al., 2025), and SWDE (Lockard
+et al., 2019) as the recall performance.
+Efficiency Measurement All efficiency measurements
+are conducted on servers with a single NVIDIA A800
+GPU, using PyTorch version 2.9.1 and CUDA version 12.4
+Softmax attention is implemented with Flash-Attention2 (Dao, 2024), version 2.8.3. Mamba2 is implemented
+its official CUDA kernel, version 2.3.0. Other RNN mixers
+are implemented with Triton kernels from Flash-LinearAttention (Yang & Zhang, 2024), version 0.4.1. Batch size
+is set to 1 for all models to ensure fair comparison.
+6.2. Main Results: Distilling from Owen3
+Figure | shows the CSR performance and efficiency of HypeNet compared to the Qwen3 series, and Table 2 reports
+the long-context recall performance. Also in Table 2, HypeNet + HALO is compared against recently released stateof-the-art hybrid models that are distilled from pre-trained
+
+Transformer models.
+Takeaway 1 Under 128K context length, HypeNet is
+much more efficient than Qwen3 in terms of memory and
+throughput due to the reduced number of attention layers.
+and this tradeoff advantage increases with the context leneth
+Takeaway 2 Compared to state-of-the-art Transformer-tohybrid methods, HypeNet + HALO achieve superior longcontext performance, despite using fewer training tokens.
+training with only open-source data, and being smaller than
+KIL-LS (GDN).
+6.3. HvpeNet Ablations: Training From Scratch
+To validate the effectiveness of HypeNet, we pre-train 500M
+HypeNet variants from scratch with 20B tokens and compare them against common baselines. The experimental
+details are reported in Appendix H.
+Position Encoding We compare HyPE against ordinary
+Transformer with RoPE and SWAN-GPT (Puvvada et al.
+2025), which is an architecture with a similar PE but is not
+a hybrid model. We also compare with HypeNet variants
+without HyPE (i.e., all RoPE, all NoPE, or attention RoPE +
+RNN NoPE). The result, reported in Figure 4, demonstrates
+that HyPE’s length generalization abilities outperform existing PE by a large margin. Notably, we find that, compared
+to conversion from pre-trained checkpoints, training HyPE
+from scratch achieves even better length generalization (having 93.5% NIAH accuracy on 64% the training context
+length), demonstrating the great potential of HyPE.
+Different RNN Mixers Moreover, we also compare the
+performance of incorporating different RNN mixers (those
+mentioned in Section 5.3), and report the results in Figure 5
+Perhaps surprisingly, Lightning Attention outperforms more
+
+[PAGE 8]
+
+_Table 3. Ablation experiment results for various architectural choices in HypeNet-2B, converted from Owen3-1.7B_
+[TABLE: The table compares the performance of HypeNet and its ablated variants on the Needle-in-a-Haystack task across different sequence lengths, showing CSR and accuracy percentages.]
+| Model | CSR | 4K | 8K | 16K | 32K | 64K | 128K |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| HypeNet | 55.9 | 95.9 | 94.9 | 90.3 | 94.1 | 90.6 | 79.9 |
+| w/o RNN RoPE (①) | 53.8 | 82.3 | 82.7 | 79.1 | 76.1 | 72.4 | 47.9 |
+| w/ attention RoPE (①) | 55.8 | 95.3 | 95.3 | 87.0 | 67.1 | 37.2 | 19.7 |
+| w/o RNN QK-norm (②) | 55.3 | 91.7 | 92.3 | 89.1 | 73.9 | 53.5 | 17.3 |
+| w/o RNN GQA to MHA (③) | 55.8 | 89.7 | 90.0 | 87.9 | 89.5 | 88.9 | 83.5 |
+| w/o RNN output gate (④) | 55.6 | 91.1 | 89.3 | 84.6 | 84.9 | 81.3 | 74.5 |
+| w/o attention output gate (④) | 55.4 | 95.5 | 93.3 | 88.2 | 92.5 | 87.3 | 80.9 |
+_①, ②, ③, ④ refer to specific ablation components explained elsewhere in the document._
+_Table 4. Comparison of different attention layer selection methods on CSR and NIAH tasks. All models are converted from Qwen3 with
+HALO. but use different layer selection methods. The best scores are bolded._
+[TABLE: The table compares the CSR and Needle-in-a-Haystack performance metrics at various sequence lengths (8K to 256K) for different models, highlighting HALO's competitive results.]
+| Model | CSR | 8K | 16K | 32K | 64K | 128K | 256K |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-1.7B (teacher, no RNNs) | 58.5 | 99.7 | 99.9 | 99.9 | 99.5 | 38.6 | 18.4 |
+| HALO (ours) | 55.9 | 94.9 | 90.3 | 94.1 | 90.6 | 79.9 | 74.3 |
+| Jet-Nemotron-2B (Gu et al., 2025) | 55.0 | 88.7 | 70.1 | 70.3 | 61.9 | 63.7 | 56.2 |
+| KL-LS (Li et al., 2025) | 55.3 | 85.7 | 78.4 | 72.8 | 68.9 | 58.3 | 44.3 |
+| Evenly distribute attn. layers | 54.0 | 78.1 | 77.8 | 68.2 | 73.5 | 61.9 | 50.9 |
+| Evenly distribute attn. layers in the latter half | 55.8 | 42.5 | 39.6 | 50.5 | 41.2 | 39.2 | 40.4 |
+| RADLADS (RNN-only) (Goldstein et al., 2025) | 56.0 | 64.1 | 16.4 | 2.0 | 0.0 | 0.0 | 0.0 |
+recent RNN variants in terms of length generalization despite having a simpler update rule. One possible explanation is that Lightning Attention employs data-independent
+forget gates. In contrast, the other RNN mixers have datadependent forget gates, which may result in poor length
+generalization, as shown by Chen et al. (2025b).
+Takeaway The incorporation of HyPE and Lightning Attention is both essential for achieving the exceptional length
+generalization of HypeNet.
+6.4. HALO Ablations: Architectural Modifications
+This section validates the effectiveness of various architectural modifications of HALO (those marked with 0, @, ®.
+and @ in Figure 3). Table 3 reports the ablation results when
+converting Qwen3-1.7B, and it shows that our architectural
+modifications provide effective gains in CSR and NIAH performance, considerably outperforming common approaches
+in training hybrid architectures.
+6.5. HALO Ablations: Attention Laver Selection
+Here, we compare our proposed layer selection method (described in Section 4.3) with two state-of-the-art approaches
+for determining layer importance, Jet-Nemotron (Gu et al..
+2025) and KL-LS (Li et al., 2025), as well as some naive
+baselines that evenly distribute attention layers. We do not
+run the entire distillation procedures of Jet-Nemotron ot
+KL-LS, which involve training on much more data. Our
+comparison is performed by replacing our attention layer se
+lection method in HALO with these previous methods. The
+result is reported in Table 4, and it shows that our selection
+method achieves a better overall performance in terms of
+CSR and recall.
+6.6. Efficiency Results
+[CHART (line)]
+  Insight: HypeNet is significantly more efficient than Qwen3 in processing longer context lengths, with up to 3.4x lower time per token at 512K context length.
+  Trends: Both Qwen3 and HypeNet show increasing time per token with increasing context length; Qwen3 increases more steeply than HypeNet; At 512K context length, Qwen3 time per token is 3.4 times that of HypeNet
+| Context Length | Qwen3 (μs) | HypeNet (μs) |
+|----------------|------------|--------------|
+| 0              | 40         | 20           |
+| 256K           | 180        | 60           |
+| 512K           | 350        | 105          |
+| 1M             | -          | 210          |
+_Figure 6. The prefilling time of HypeNet versus Qwen3-1.7B
+across different context lengths._
+Figure | (center) shows the throughput of HypeNet models
+of different sizes (2B, 5B, and 9B) at 128K context length.
+and Figure | (right) shows the time per output token (TPOT)
+across different context lengths. Figure 6 shows the prefill
+speed results. We also provide a comparison of the runtime
+of various RNN mixers in Appendix E.1. In brief, HypeNet
+
+[PAGE 9]
+
+achieves up to 3.0x decoding speedup and 3.4~ prefilling
+speedup on 512K context length, before Qwen3-1.7B runs
+out of GPU memory on 1M context length.
+7 Conclusion
+We have proposed HALO, a novel distillation procedure
+for converting pre-trained Transformer models into RNNattention hybrid architectures with less than 3B tokens
+We also proposed HypeNet, a hybrid architecture based
+on a novel PE scheme called HyPE, and it achieves superior length generalization. Applying our methods to
+Qwen3 produces a series of hybrid models with much better
+performance-throughput tradeoff and memory-efficiency on
+long-context scenarios. We believe that our work is valuable for research in cost-efficient long-context LLMs, which
+enables many useful applications such as long-horizon reasoning and agentic behaviors. Our work also fosters research in novel LLM architectures by making it cheaper to
+empirically validate hybrid architectures at scale.
+T imitations
+Our hybrid models are obtained through a conversion process trained on the FineWeb-Edu corpus, which primarily
+consists of pre-training-style data. As a result, instructionfollowing and alignment behaviors of the pre-training model
+introduced by post-training may be diminished by our conversion process. However, this is a common shortcoming of
+all existing distillation methods for converting into hybrid
+architectures. How to efficiently recover the base models’
+capabilities remains an open question.
+Moreover, our conversion protocol is designed specifically
+for Transformer-based architectures. Hence, its applicability
+to other model architectures requires further investigation.
+although the vast majority of publicly available LLMs are
+Transformer-based.
+Impact Statement
+This paper presents work whose goal is to advance the field
+of machine learning. There are many potential societal
+consequences of our work, none of which we feel must be
+specifically highlighted here.
+References
+Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,
+Lebron, F., and Sanghai, S$. GQA: Training Generalized Multi-Query Transformer Models from Multi-Head
+Checkpoints, 2023. URL https://arxiv.org/ab
+s/2305.13245.
+
+Arora, S., Yang, B., Eyuboglu, S., Narayan, A., Hojel,
+A., Trummer, L, and Ré, C. Language Models Enable Simple Systems for Generating Structured Views
+of Heterogeneous Data Lakes, 2025. URL https:
+//arxiv.org/abs/2304.09433.
+
+Bick, A., Li, K. Y., Xing, E. P., Kolter, J. Z., and Gu, A.
+Transformers to SSMs: Distilling Quadratic Knowledge
+to Subquadratic Models, 2025. URL https: //arxi
+v.org/abs/2408.10189.
+
+Bisk, Y., Zellers, R., Bras, R. L., Gao, J., and Choi, Y. PIQA:
+Reasoning about Physical Commonsense in Natural Language, 2019. URL https://arxiv.org/abs/19
+11.11641.
+
+Chen, Y., Wu, Y., Song, C., Thai, Z. L., Shen, X., Han,
+X., Liu, Z., and Sun, M. Cost-Optimal Grouped-Query
+Attention for Long-Context Modeling, 2025a. URL ht
+tps://arxiv.org/abs/2503.09579.
+
+Chen, Y., Zhang, X., Hu, S., Han, X., Liu, Z., and Sun, M.
+Stuffed Mamba: Oversized States Lead to the Inability
+to Forget, 2025b. URL https: //arxiv.org/abs/
+2410.07145.
+
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A.,
+Schoenick, C., and Tafjord, O. Think you have Solved
+Question Answering? Try ARC, the AI2 Reasoning Challenge, 2018. URL https: //arxiv.org/abs/18
+03.05457.
+
+Dao, T. FlashAttention-2: Faster Attention with Better
+Parallelism and Work Partitioning. In International Conference on Learning Representations (ICLR), 2024.
+
+Dao, T. and Gu, A. Transformers are SSMs: Generalized
+models and efficient algorithms through structured state
+space duality, 2024. URL https://arxiv.org/ab
+s/2405.21060.
+
+Gao, L., Tow, J., Abbasi, B., Biderman, S., Black, S., DiPofi,
+A., Foster, C., Golding, L., Hsu, J., Le Noac’h, A., Li,
+H., McDonell, K., Muennighoff, N., Ociepa, C., Phang,
+J., Reynolds, L., Schoelkopf, H., Skowron, A., Sutawika,
+L., Tang, E., Thite, A., Wang, B., Wang, K., and Zou, A.
+The language model evaluation harness, 07 2024. URL
+https: //zenodo.org/records/12608602.
+
+Gemma, T., Kamath, A., Ferret, J., Pathak, S., Vieillard,
+N., Merhej, R., Perrin, S., Matejovicova, T., Ramé, A.,
+Riviére, M., Rouillard, L., Mesnard, T., Cideron, G.,
+bastien Grill, J., Ramos, S., Yvinec, E., Casbon, M., Pot,
+E., Penchev, L., Liu, G., Visin, F, Kenealy, K., Beyer,
+L., Zhai, X., Tsitsulin, A., Busa-Fekete, R., Feng, A.,
+Sachdeva, N., Coleman, B., Gao, Y., Mustafa, B., Barr, L.,
+Parisotto, E., Tian, D., Eyal, M., Cherry, C., Peter, J.-T.,
+Sinopalnikov, D., Bhupatiraju, S., Agarwal, R., Kazemi,
+
+[PAGE 10]
+
+M., Malkin, D., Kumar, R., Vilar, D., Brusilovsky, I.,
+Luo, J., Steiner, A., Friesen, A., Sharma, A., Sharma,
+A., Gilady, A. M., Goedeckemeyer, A., Saade, A., Feng,
+A., Kolesnikov, A., Bendebury, A., Abdagic, A., Vadi,
+A., Gyorgy, A., Pinto, A. S., Das, A., Bapna, A., Miech,
+A., Yang, A., Paterson, A., Shenoy, A., Chakrabarti, A.,
+Piot, B., Wu, B., Shahriari, B., Petrini, B., Chen, C.,
+Lan, C. L., Choquette-Choo, C. A., Carey, C., Brick,
+C., Deutsch, D., Eisenbud, D., Cattle, D., Cheng, D.,
+Paparas, D., Sreepathihalli, D. S., Reid, D., Tran, D.,
+Zelle, D., Noland, E., Huizenga, E., Kharitonov, E.,
+Liu, F., Amirkhanyan, G., Cameron, G., Hashemi, H.,
+Klimezak-Plucifiska, H., Singh, H., Mehta, H., Lehri,
+H. T., Hazimeh, H., Ballantyne, I., Szpektor, I., Nardini,
+L, Pouget-Abadie, J., Chan, J., Stanton, J., Wieting, J.,
+Lai, J., Orbay, J., Fernandez, J., Newlan, J., yeong Ji,
+J., Singh, J., Black, K., Yu, K., Hui, K., Vodrahalli, K.,
+Greff, K., Qiu, L., Valentine, M., Coelho, M., Ritter,
+M., Hoffman, M., Watson, M., Chaturvedi, M., Moynihan, M., Ma, M., Babar, N., Noy, N., Byrd, N., Roy, N.,
+Momchey, N., Chauhan, N., Sachdeva, N., Bunyan, O.,
+Botarda, P., Caron, P., Rubenstein, P. K., Culliton, P.,
+Schmid, P., Sessa, P. G., Xu, P., Stanczyk, P., Tafti, P.,
+Shivanna, R., Wu, R., Pan, R., Rokni, R., Willoughby,
+R., Vallu, R., Mullins, R., Jerome, S., Smoot, S., Girgin, S., Iqbal, S., Reddy, S., Sheth, S., Poder, S., Bhatnagar, S., Panyam, S. R., Eiger, S., Zhang, S., Liu, T.,
+Yacovone, T., Liechty, T., Kalra, U., Evci, U., Misra,
+V., Roseberry, V., Feinberg, V., Kolesnikov, V., Han,
+W., Kwon, W., Chen, X., Chow, Y., Zhu, Y., Wei, Z.,
+Egyed, Z., Cotruta, V., Giang, M., Kirk, P., Rao, A.,
+Black, K., Babar, N., Lo, J., Moreira, E., Martins, L. G.,
+Sanseviero, O., Gonzalez, L., Gleicher, Z., Warkentin, T.,
+Mirrokni, V., Senter, E., Collins, E., Barral, J., Ghahramani, Z., Hadsell, R., Matias, Y., Sculley, D., Petrov,
+S., Fiedel, N., Shazeer, N., Vinyals, O., Dean, J., Hassabis, D., Kavukcuoglu, K., Farabet, C., Buchatskaya, E.,
+Alayrac, J.-B., Anil, R., Dmitry, Lepikhin, Borgeaud, S.,
+Bachem, O., Joulin, A., Andreev, A., Hardin, C., Dadashi,
+R., and Hussenot, L. Gemma 3 technical report, 2025.
+URL https://arxiv.org/abs/2503.19786.
+
+Goldstein, D., Alcaide, E., Lu, J., and Cheah, E. RADLADS:
+Rapid Attention Distillation to Linear Attention Decoders
+at Scale, 2025. URL https://arxiv.org/abs/
+2505.03005.
+
+Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle, A., Letman, A., Mathur, A., Schelten, A., Vaughan, A., Yang, A., Fan, A., Goyal, A.,
+Hartshorn, A., Yang, A., Mitra, A., Sravankumar, A., Korenev, A., Hinsvark, A., Rao, A., Zhang, A., Rodriguez,
+A., Gregerson, A., Spataru, A., Roziere, B., Biron, B.,
+Tang, B., Chern, B., Caucheteux, C., Nayak, C., Bi, C.,
+Marra, C., McConnell, C., Keller, C., Touret, C., Wu,
+C., Wong, C., Ferrer, C. C., Nikolaidis, C., Allonsius,
+D., Song, D., Pintz, D., Livshits, D., Wyatt, D., Esiobu, D., Choudhary, D., Mahajan, D., Garcia-Olano,
+D., Perino, D., Hupkes, D., Lakomkin, E., AlBadawy, E.,
+and more. The Llama 3 Herd of Models, 2024. URL
+https: //arxiv.org/abs/2407.21783.
+
+Gu, A. and Dao, T. Mamba: Linear-Time Sequence Modeling with Selective State Spaces, 2024. URL https:
+//arxiv.org/abs/2312.00752.
+
+Gu, Y., Hu, Q., Yang, S., Xi, H., Chen, J., Han, S., and
+Cai, H. Jet-Nemotron: Efficient Language Model with
+Post Neural Architecture Search, 2025. URL https:
+//arxiv.org/abs/2508.15884.
+
+Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika,
+M., Song, D., and Steinhardt, J. Measuring Massive
+Multitask Language Understanding, 2021. URL https:
+//arxiv.org/abs/2009.03300.
+
+Henry, A., Dachapally, P. R., Pawar, S., and Chen, Y. QueryKey Normalization for Transformers, 2020. URL http
+s://arxiv.org/abs/2010.04245.
+
+Hoshino, Y., Tachibana, H., Inahara, M., and Takegawa, H.
+RAD: Redundancy-aware distillation for hybrid models
+via self-speculative decoding, 2025. URL https: //
+arxiv.org/abs/2505.22135.
+
+Hsieh, C.-P., Sun, S., Kriman, S., Acharya, S., Rekesh, D.,
+Jia, F., Zhang, Y., and Ginsburg, B. RULER: What’s
+the Real Context Size of Your Long-Context Language
+Models?, 2024. URL https://arxiv.org/abs/
+2404.06654.
+
+Hu, S., Tu, Y., Han, X., He, C., Cui, G., Long, X., Zheng,
+Z., Fang, Y., Huang, Y., Zhao, W., Zhang, X., Thai, Z. L.,
+Zhang, K., Wang, C., Yao, Y., Zhao, C., Zhou, J., Cai,
+J., Zhai, Z., Ding, N., Jia, C., Zeng, G., Li, D., Liu, Z.,
+and Sun, M. MiniCPM: Unveiling the Potential of Small
+Language Models with Scalable Training Strategies, 2024.
+URL https://arxiv.org/abs/2404.06395.
+
+Jelassi, S., Brandfonbrener, D., Kakade, S. M., and Malach,
+E. Repeat After Me: Transformers are Better than State
+Space Models at Copying, 2024. URL https://arxi
+v.org/abs/2402.01032.
+
+Kasai, J., Peng, H., Zhang, Y., Yogatama, D., Ilharco, G.,
+Pappas, N., Mao, Y., Chen, W., and Smith, N. A. Finetuning Pretrained Transformers into RNNs, 2021. URL
+https: //arxiv.org/abs/2103.13076.
+
+Katharopoulos, A., Vyas, A., Pappas, N., and Fleuret,
+F. Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention, 2020. URL https:
+//arxiv.org/abs/2006.16236.
+
+[PAGE 11]
+
+Kazemnejad, A., Padhi, I., Ramamurthy, K. N., Das, P., and
+Reddy, S. The Impact of Positional Encoding on Length
+Generalization in Transformers, 2023. URL https:
+//arxiv.org/abs/2305.19466.
+
+Kimi, T., Zhang, Y., Lin, Z., Yao, X., Hu, J., Meng, F., Liu,
+C., Men, X., Yang, S., Li, Z., Li, W., Lu, E., Liu, W.,
+Chen, Y., Xu, W., Yu, L., Wang, Y., Fan, Y., Zhong, L.,
+Yuan, E., Zhang, D., Zhang, Y., Liu, T. Y., Wang, H., Fang,
+S., He, W., Liu, S., Li, Y., Su, J., Qiu, J., Pang, B., Yan,
+J., Jiang, Z., Huang, W., Yin, B., You, J., Wei, C., Wang,
+Z., Hong, C., Chen, Y., Chen, G., Wang, Y., Zheng, H.,
+Wang, F., Liu, Y., Dong, M., Zhang, Z., Pan, S., Wu, W.,
+Wu, Y., Guan, L., Tao, J., Fu, G., Xu, X., Wang, Y., Lai,
+G., Wu, Y., Zhou, X., Yang, Z., and Du, Y. Kimi Linear:
+An Expressive, Efficient Attention Architecture, 2025.
+URL https://arxiv.org/abs/2510.26692.
+
+Li, Y., Yang, S., Tan, S., Mishra, M., Panda, R., Zhou,
+J., and Kim, Y. Distilling to Hybrid Attention Models
+via KL-Guided Layer Selection, 2025. URL https:
+//arxiv.org/abs/2512.20569.
+
+Lieber, O., Lenz, B., Bata, H., Cohen, G., Osin, J., Dalmedigos, L, Safahi, E., Meirom, S., Belinkov, Y., ShalevShwartz, S., Abend, O., Alon, R., Asida, T., Bergman,
+A., Glozman, R., Gokhman, M., Manevich, A., Ratner,
+N., Rozen, N., Shwartz, E., Zusman, M., and Shoham, Y.
+Jamba: A Hybrid Transformer-Mamba Language Model,
+2024. URL https://arxiv.org/abs/2403.1
+9887.
+
+Lockard, C., Shiralkar, P., and Dong, X. L. OpenCeres:
+When Open Information Extraction Meets the SemiStructured Web. 2019. URL https://aclantholo
+gy .org/N19-1309/.
+
+MiniMax, Li, A., Gong, B., Yang, B., Shan, B., Liu, C.,
+Zhu, C., Zhang, C., Guo, C., Chen, D., Li, D., Jiao, E.,
+Li, G., Zhang, G., Sun, H., Dong, H., Zhu, J., Zhuang, J.,
+Song, J., Zhu, J., Han, J., Li, J., Xie, J., Xu, J., Yan, J.,
+Zhang, K., Xiao, K., Kang, K., Han, L., Wang, L., Yu,
+L., Feng, L., Zheng, L., Chai, L., Xing, L., Ju, M., Chi,
+M., Zhang, M., Huang, P., Niu, P., Li, P., Zhao, P., Yang,
+Q., Xu, Q., Wang, Q., Wang, Q., Li, Q., Leng, R., Shi, S.,
+Yu, S., Li, S., Zhu, S., Huang, T., Liang, T., Sun, W., Sun,
+W., Cheng, W., Li, W., Song, X., Su, X., Han, X., Zhang,
+X., Hou, X., Min, X., Zou, X., Shen, X., Gong, Y., Zhu,
+Y., Zhou, Y., Zhong, Y., Hu, Y., Fan, Y., Yu, Y., Yang,
+Y., Li, Y., Huang, Y., Li, Y., Huang, Y., Xu, Y., Mao, Y.,
+Li, Z., Li, Z., Tao, Z., Ying, Z., Cong, Z., Qin, Z., Fan,
+Z., Yu, Z., Jiang, Z., and Wu, Z. MiniMax-01: Scaling
+Foundation Models with Lightning Attention, 2025. URL
+https: //arxiv.org/abs/2501.08313.
+
+NVIDIA, Blakeman, A., Grattafiori, A., Basant, A., Gupta,
+A., Khattar, A., Renduchintala, A., Vavre, A., Shukla, A.,
+Bercovich, A., Ficek, A., Shaposhnikov, A., Kondratenko,
+A., Bukharin, A., Milesi, A., Taghibakhshi, A., Liu, A.,
+Barton, A., Mahabaleshwarkar, A. S., Klein, A., Zuker,
+A., Geifman, A., Shen, A., Bhiwandiwalla, A., Tao, A.,
+Agrusa, A., Verma, A., Guan, A., Mandarwal, A., Mehta,
+A., Aithal, A., Poojary, A., Ahamed, A., Mishra, A.,
+Thekkumpate, A. K., Dattagupta, A., Zhu, B., Sadeghi,
+B., Simkin, B., Lanir, B., Schifferer, B., Nushi, B., Kartal,
+B., Rouhani, B. D., Ginsburg, B., Norick, B., Soubasis,
+B., Kisacanin, B., Yu, B., and more. NVIDIA Nemotron
+3: Efficient and Open Intelligence, 2025. URL https:
+//arxiv.org/abs/2512.20856.
+
+Paperno, D., Kruszewski, G., Lazaridou, A., Pham, Q. N.,
+Bernardi, R., Pezzelle, S., Baroni, M., Boleda, G., and
+Fernandez, R. The LAMBADA dataset: Word prediction
+requiring a broad discourse context, 2016. URL https:
+//arxiv.org/abs/1606.06031.
+
+Penedo, G., Kydliéek, H., allal, L. B., Lozhkov, A., Mitchell,
+M., Raffel, C., Werra, L. V., and Wolf, T. The FineWeb
+Datasets: Decanting the Web for the Finest Text Data at
+Scale, 2024. URL https://arxiv.org/abs/24
+06.17557.
+
+Peng, B., Quesnelle, J., Fan, H., and Shippole, E. YaRN:
+Efficient Context Window Extension of Large Language
+Models, 2023. URL https://arxiv.org/abs/
+2309.00071.
+
+Peng, B., Zhang, R., Goldstein, D., Alcaide, E., Du, X.,
+Hou, H., Lin, J., Liu, J., Lu, J., Merrill, W., Song, G., Tan,
+K., Utpala, S., Wilce, N., Wind, J. S., Wu, T., Wuttke, D..,
+and Zhou-Zheng, C. RWKV-7 ”Goose” with Expressive
+Dynamic State Evolution, 2025. URL https: //arxi
+v.org/abs/2503.14456.
+
+Puvvada, K. C., Ladhak, F., Serrano, S. A., Hsieh, C.-P.,
+Acharya, S., Majumdar, S., Jia, F., Kriman, S., Sun, S.,
+Rekesh, D., and Ginsburg, B. SWAN-GPT: An Efficient
+and Scalable Approach for Long-Context Language Modeling, 2025. URL https://arxiv.org/abs/25
+04.08719.
+
+Qin, Z., Sun, W., Li, D., Shen, X., Sun, W., and Zhong,
+Y. Various Lengths, Constant Speed: Efficient Language
+Modeling with Lightning Attention, 2024a. URL https:
+//arxiv.org/abs/2405.17381.
+
+Qin, Z., Yang, S., Sun, W., Shen, X., Li, D., Sun, W., and
+Zhong, Y. HGRN2: Gated Linear RNNs with State Expansion, 2024b. URL https: //arxiv.org/abs/
+2404.07904.
+
+Qiu, Z., Wang, Z., Zheng, B., Huang, Z., Wen, K., Yang, S.,
+Men, R., Yu, L., Huang, F., Huang, S., Liu, D., Zhou, J.,
+and Lin, J. Gated Attention for Large Language Models:
+
+[PAGE 12]
+
+Non-linearity, Sparsity, and Attention-Sink-Free, 2025.
+URL https://arxiv.org/abs/2505.06708.
+
+Qwen. Qwen3-Next: Towards Ultimate Training & Inference Efficiency, 2025. URL https: //qwen.ai/bl
+og?id=4074cca80393150c248e508aab2983
+£9cb7d27cd.
+
+Rajpurkar, P., Zhang, J., Lopyrev, K., and Liang, P. SQUAD:
+100,000+ Questions for Machine Comprehension of Text,
+2016. URL https://arxiv.org/abs/1606.0
+5250.
+
+Sakaguchi, K., Bras, R. L., Bhagavatula, C., and Choi, Y.
+Winogrande: An adversarial winograd schema challenge
+at scale, 2019. URL https://arxiv.org/abs/19
+07.10641.
+
+Shen, X., Chen, Y., Thai, Z. L., Han, X., Liu, Z., and Sun, M.
+StateX: Enhancing RNN Recall via Post-training State
+Expansion, 2025. URL https: //arxiv.org/abs/
+2509.22630.
+
+Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., and Liu, Y.
+RoFormer: Enhanced Transformer with Rotary Position
+Embedding, 2023. URL https://arxiv.org/ab
+s/2104.09864.
+
+Sun, Y., Dong, L., Huang, S., Ma, S., Xia, Y., Xue, J.,
+Wang, J., and Wei, F. Retentive Network: A Successor
+to Transformer for Large Language Models, 2023. URL
+https: //arxiv.org/abs/2307.08621.
+
+Sun, Y., Li, X., Dalal, K., Xu, J., Vikram, A., Zhang, G.,
+Dubois, Y., Chen, X., Wang, X., Koyejo, S., Hashimoto,
+T., and Guestrin, C. Learning to (Learn at Test Time):
+RNNs with Expressive Hidden States, 2025. URL http
+s://arxiv.org/abs/2407.04620.
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+L., Gomez, A. N., Kaiser, L., and Polosukhin, I. Attention
+Is All You Need, 2017. URL https: //arxiv.org/
+abs/1706.03762.
+
+Wang, D., Zhu, R.-J., Abreu, S., Shan, Y., Kergan, T.,
+Pan, Y., Chou, Y., Li, Z., Zhang, G., Huang, W., and
+Eshraghian, J. A Systematic Analysis of Hybrid Linear
+Attention, 2025a. URL https://arxiv.org/abs/
+2507.06457.
+
+Wang, J., Ji, T., Wu, Y., Yan, H., Gui, T., Zhang, Q., Huang,
+X., and Wang, X. Length Generalization of Causal
+Transformers without Position Encoding, 2024. URL
+https://arxiv.org/abs/2404.12224.
+
+Wang, J., Paliotta, D., May, A., Rush, A. M., and Dao, T.
+The Mamba in the Llama: Distilling and accelerating
+hybrid models, 2025b. URL https: //arxiv.org/
+abs/2408.15237.
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng,
+B., Yu, B., Gao, C., Huang, C., Lv, C., Zheng, C., Liu,
+D., Zhou, F., Huang, F., Hu, F., Ge, H., Wei, H., Lin,
+H., Tang, J., Yang, J., Tu, J., Zhang, J., Yang, J., Yang,
+J., Zhou, J., Zhou, J., Lin, J., Dang, K., Bao, K., Yang,
+K., Yu, L., Deng, L., Li, M., Xue, M., Li, M., Zhang,
+P., Wang, P., Zhu, Q., Men, R., Gao, R., Liu, S., Luo,
+S., Li, T., Tang, T., Yin, W., Ren, X., Wang, X., Zhang,
+X., Ren, X., Fan, Y., Su, Y., Zhang, Y., Zhang, Y., Wan,
+Y., Liu, Y., Wang, Z., Cui, Z., Zhang, Z., Zhou, Z., and
+Qiu, Z. Qwen3 Technical Report, 2025a. URL https:
+//arxiv.org/abs/2505.09388.
+
+Yang, M., Rezagholizadeh, M., Li, G., Appia, V., and Barsoum, E. Zebra-Llama: Towards Extremely Efficient
+Hybrid Models, 2026. URL https://arxiv.org/
+abs/2505.17272.
+
+Yang, S. and Zhang, Y. FLA: A Triton-Based Library for
+Hardware-Efficient Implementations of Linear Attention
+Mechanism, January 2024. URL https: //github
+.com/fla-org/flash-linear-attention.
+
+Yang, S., Wang, B., Shen, Y., Panda, R., and Kim, Y. Gated
+Linear Attention Transformers with Hardware-Efficient
+Training, 2024. URL https://arxiv.org/abs/
+2312.06635.
+
+Yang, S., Kautz, J., and Hatamizadeh, A. Gated Delta
+Networks: Improving Mamba2 with Delta Rule, 2025b.
+URL https://arxiv.org/abs/2412.06464.
+
+Yang, S., Wang, B., Zhang, Y., Shen, Y., and Kim, Y. Parallelizing Linear Transformers with the Delta Rule over
+Sequence Length, 2025c. URL https: //arxiv.or
+g/abs/2406.06484.
+
+Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and Choi, Y.
+HellaSwag: Can a Machine Really Finish Your Sentence?,
+2019. URL https://arxiv.org/abs/1905.0
+7830.
+
+Zhang, B. and Sennrich, R. Root mean square layer normalization, 2019. URL https://arxiv.org/abs/19
+10.07467.
+
+Zhang, M., Arora, S., Chalamala, R., Wu, A., Spector, B.,
+Singhal, A., Ramesh, K., and Ré, C. LoLCATs: On LowRank Linearizing of Large Language Models, 2025. URL
+https://arxiv.org/abs/2410.10254.
+
+Zhang, Y., Yang, S., Zhu, R., Zhang, Y., Cui, L., Wang, Y.,
+Wang, B., Shi, F., Wang, B., Bi, W., Zhou, P., and Fu, G.
+Gated Slot Attention for Efficient Linear-Time Sequence
+Modeling, 2024. URL https: //arxiv.org/abs/
+2409.07146.
+
+[PAGE 13]
+
+Here, we present a complete formulation of HypeNet for clarity. Recall that the model consists of a stack of L layers that
+consists of a token mixer and MLP:
+where | € {1,--- , L} is the layer index and Norm(-) represents an RMSNorm (Zhang & Sennrich, 2019). Then, each mixer
+is either an attention layer ATTN(-) or an RNN layer RNN(-), specified by an attention index set Zan:
+  {formula: \[ l \in \{1, \cdots, L\} \]}
+  [meaning: This formula defines the variable l as an integer index ranging from 1 to L.]
+  {formula: $L_{attn}$}
+  [meaning: This symbol represents the attention loss, typically used in models involving attention mechanisms to quantify the error or difference related to attention weights.]
+Since the MLP layer is exactly the same as the one in the base model, we omit its formulation. Each attention layer and
+RNN layer consists of n;, heads, that are identical (except for the KV sharing mechanism in GQA). Thus, in the following
+formulations, we omit the head index and only give the formulation for a single head for simplicity. The output of the layer
+is the sum of the outputs of all heads.
+  {formula: $n_h$}
+  [meaning: This formula represents the variable denoting the number of hidden units in a hidden layer of a neural network.]
+where W,, Wx, Wi, Wo, Wz © R¢*4» are learnable parameters, and s; is the position-dependent scaling factor, and a is
+a hyperparameter. Depending on the base model, there may be a QK-norm in attention layers.
+  {formula: \[ \mathbf{W}_q, \mathbf{W}_k, \mathbf{W}_v, \mathbf{W}_o, \mathbf{W}_z \in \mathbb{R}^{d \times d_h} \]}
+  [meaning: This formula defines a set of weight matrices used in a neural network, each mapping from a d-dimensional space to a d_h-dimensional space, commonly used in attention mechanisms.]
+  {formula: $S_t$}
+  [meaning: This formula represents the state variable at a specific time t.]
+where W,, W;, Wy, Wo, Wz € R¢*“ are learnable parameters, and + is the head-specific slope rate of Lightning
+Attention (Qin et al., 2024a), which is a data-independent forget gate. RoPE, is the rotational matrix of RoPE (Su et al..
+2023) for position t.
+  {formula: $\mathbf{W}_q, \mathbf{W}_k, \mathbf{W}_v, \mathbf{W}_o, \mathbf{W}_z \in \mathbb{R}^{d \times d_h}$}
+  [meaning: This formula defines that the matrices W_q, W_k, W_v, W_o, and W_z are all real-valued matrices with dimensions d by d_h, typically used as weight matrices in attention mechanisms or neural network layers.]
+A. Complete Formulation of HypeNet
+Attention Layers Each attention layer can be written as follows:
+RNN Lavers' Each RNN laver can be written as follows:
+$$
+\[
+\mathbf{H}^{(l)} = \text{Mixer}^{(l)}\left( \text{Norm}\left( \mathbf{X}^{(l-1)} \right) \right) + \mathbf{X}^{(l-1)} \in \mathbb{R}^{T \times d} \\
+\mathbf{X}^{(l)} = \text{MLP}^{(l)}\left( \text{Norm}\left( \mathbf{H}^{(l)} \right) \right) + \mathbf{H}^{(l)} \in \mathbb{R}^{T \times d}
+\]
+$$
+  [update_rule: These equations describe the forward pass update rules for a layer l in a neural network architecture that uses a Mixer block followed by a Multi-Layer Perceptron (MLP), each preceded by normalization and residual connections.]
+$$
+\[ \text{Mixer}^{(l)} = \begin{cases} \text{ATTN}^{(l)} & \text{if } l \in \mathcal{I}_{\text{attn}} \\ \text{RNN}^{(l)} & \text{otherwise} \end{cases} \]
+$$
+  [definition: Defines the Mixer function at layer l as either an attention module if the layer index l is in the set of attention layers, or as an RNN module otherwise.]
+$$
+\[
+\begin{aligned}
+\mathbf{q}_t &= \mathbf{x}_t \mathbf{W}_q \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{k}_t &= \mathbf{x}_t \mathbf{W}_k \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{v}_t &= \mathbf{x}_t \mathbf{W}_v \in \mathbb{R}^{1 \times d_h} \\
+\tilde{\mathbf{q}}_t &= \frac{s_t \mathbf{q}_t}{\sqrt{d_h}} \in \mathbb{R}^{1 \times d_h}, \quad s_t = \log_a (t + a) \in \mathbb{R} \\
+\mathbf{o}_t &= \sum_{i=1}^t \frac{\exp \left( \tilde{\mathbf{q}}_t \mathbf{k}_i^\top \right) \mathbf{v}_i}{\sum_{j=1}^t \exp \left( \tilde{\mathbf{q}}_j \mathbf{k}_j^\top \right)} \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{z}_t &= \mathrm{sigmoid} (\mathbf{x}_t \mathbf{W}_z) \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{y}_t &= (\mathrm{Norm}(\mathbf{o}_t) \odot \mathbf{z}_t) \mathbf{W}_q^\top \in \mathbb{R}^{1 \times d}
+\end{aligned}
+\]
+$$
+  [definition: This set of equations defines a time-dependent attention mechanism with scaled queries, softmax-based attention weights, gating via a sigmoid function, and a final output computed by normalizing the attention output, applying the gate, and projecting to the output space.]
+$$
+\[
+\begin{aligned}
+\mathbf{q}_t &= \mathrm{Norm}(\mathbf{x}_t \mathbf{W}_q) \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{k}_t &= \mathrm{Norm}(\mathbf{x}_t \mathbf{W}_k) \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{v}_t &= \mathbf{x}_t \mathbf{W}_v \in \mathbb{R}^{1 \times d_h} \\
+\tilde{\mathbf{q}}_t &= \mathrm{RoPE}_t(\mathbf{q}_t) \in \mathbb{R}^{1 \times d_h} \\
+\tilde{\mathbf{k}}_t &= \frac{\mathrm{RoPE}_t(\mathbf{k}_t)}{\sqrt{d_h}} \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{S}_t &= \mathbf{S}_{t-1} \gamma + \tilde{\mathbf{k}}_t^\top \mathbf{v}_t \in \mathbb{R}^{d_h \times d_h} \\
+\mathbf{o}_t &= \tilde{\mathbf{q}}_t \mathbf{S}_t \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{z}_t &= \sigma(\mathbf{x}_t \mathbf{W}_z) \in \mathbb{R}^{1 \times d_h} \\
+\mathbf{y}_t &= (\mathrm{Norm}(\mathbf{o}_t) \odot \mathbf{z}_t) \mathbf{W}_o^\top \in \mathbb{R}^{1 \times d}
+\end{aligned}
+\]
+$$
+  [update_rule: This set of equations describes a recurrent update rule for a transformer-like attention mechanism with rotary positional encodings, normalization, and gating. It computes query, key, and value vectors from input, applies positional encodings, updates a state matrix with decay, produces an output vector, applies a gating mechanism, and finally projects to the output space.]
+
+[PAGE 14]
+
+Forget Gate The forget gate of Lightning Attention in HypeNet is defined as:
+where h € {1,--- , H} is the head index and H is the number of heads. Notably, we do not rescale this value with a layer:
+specific factor as in the original implementation, because our preliminary results show that it does not yield performance
+gains in a hybrid model. The 7, values for each head when H = 32 is:
+  {formula: $h \in \{1, \cdots, H\}$}
+  [meaning: The variable h takes values from 1 up to H, inclusive.]
+  {formula: $H = 32$}
+  [meaning: This formula defines the variable H to be equal to 32.]
+  {formula: $\gamma_h$}
+  [meaning: This represents a variable or parameter named gamma sub h, typically used as a coefficient or factor in a larger formula or context.]
+[TABLE: The table shows a matrix of decimal values arranged in rows and columns without headers or title.]
+Table 5 reports the hyperparameters used for each stage in our conversion procedure, HALO. By default, we use AdamW
+optimizer with beta values of (0.9, 0.95) and without weight decay. Each stage use an LR linear warmup from 0 to maximum
+LR, consisting of 50 steps. We train all models with BFloat16 precision.
+_Table 5. Hyperparameters for each training stage in HALO. neace2 is the a hyperparameter that depends on the model (reported in Table 6)_
+[TABLE: The table shows the training schedule parameters across three stages including tokens, learning rate scheduler and values, context length, batch size, and training steps.]
+| Stage | Tokens | LR Scheduler | LR | Context len. | Batch size | Train steps |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 320M | Cosine | 1e-3 → 1e-5 | 512 | 32 | 20K |
+| 2 | 1B | Cosine | η_stage2 → 1e-5 | 512 | 96 | 20K |
+| 3 | 1B | Constant | 1e-5 | 16K | 128 | 500 |
+Table 6 reports the configuration of each model in this study. We also report the actual indices of the attention layers fot
+each HypeNet model in Table 7.
+Short Convolution Many recent RNNs (Dao & Gu, 2024; Yang et al., 2025b; Gu et al., 2025) incorporate a “short
+convolution” layer, which is a per-channel 1D convolutional layer with a small kernel size (typically from 2 to 4). Most
+transformer models do not have this layer. Consistent with Goldstein et al. (2025), we found that adding this component
+through post-training does not provide performance gains for the 8B model and even failed to converge when applied to
+the 1.7B model. Moreover, short convolutional layers require another dedicated CUDA kernel and more implementation
+overhead. Thus, we do not incorporate short convolutional layers in HypeNet.
+B. HALO Training Configurations
+C. HvpeNet Model Configurations
+T). Addition Notes on the Model Architecture
+$$
+\[ \gamma_h = \exp\left(-2^{-8h/H}\right) \in (0,1) \]
+$$
+  [definition: This formula defines \( \gamma_h \) as an exponential decay function of the variable h normalized by H, ensuring that \( \gamma_h \) lies strictly between 0 and 1.]
+_Table 6. Hyperparameters of various HypeNet models_
+[TABLE: The table compares hyperparameters of three HypeNet model variants (2B, 5B, 9B) including architecture sizes and training parameters.]
+| Hyperparameter | HypeNet-2B | HypeNet-5B | HypeNet-9B |
+| --- | --- | --- | --- |
+| Vocab size | 151936 | 151936 | 151936 |
+| Layers | 28 | 36 | 36 |
+| Hidden size | 2048 | 2560 | 4096 |
+| RNN layers | 7 | 8 | 8 |
+| Attn. layers | 21 | 24 | 24 |
+| FFN width | 6144 | 9728 | 12288 |
+| Attention heads | 16 | 32 | 32 |
+| Attention KV heads | 8 | 8 | 8 |
+| RNN heads | 16 | 32 | 32 |
+| Tie embeddings | Yes | Yes | Yes |
+| RoPE theta | 1M | 1M | 1M |
+| RoPE scaling | None | None | None |
+_a (in Eq. (11)) and η_stage2 (see Table 5) values are given below the main table: a = 500, 600, 900 and η_stage2 = 1e-4, 5e-5, 3e-5 for HypeNet-2B, 5B, 9B respectively._
+
+[PAGE 15]
+
+_Table 7. Layer selection results. Here are the attention layers indices sorted by importances score computed using differenct layer selectior
+methods. The top-k attention layers that are kept in the final model are highlighted with a box. The red indices in the box indicate layer:
+that are not selected by our approach._
+[TABLE: The table compares the most to least important layer indices identified by different methods for Qwen3 models of varying sizes.]
+| Method | Layer indices (most important → least important) |
+| --- | --- |
+| HALO (ours) Qwen3-1.7B | 3, 21, 2, 9, 25, 6, 8, 19, 16, 24, 12, 26, 23, 11, 27, 14, 18, 4, 7, 17, 13, 15, 20, 10, 22, 1, 0, 5 |
+| Jet-Nemotron (Gu et al., 2025) Qwen3-1.7B | 0, 21, 25, 19, 6, 11, 9, 24, 12, 2, 26, 16, 17, 23, 18, 4, 7, 3, 14, 20, 1, 27, 10, 13, 8, 22, 15, 5 |
+| KL-guided layer selection (Li et al., 2025) Qwen3-1.7B | 21, 16, 25, 24, 0, 18, 19, 20, 8, 1, 2, 11, 12, 26, 13, 17, 14, 15, 10, 9, 22, 23, 6, 7, 4, 3, 27, 5 |
+| HALO (ours) Qwen3-4B | 0, 7, 1, 33, 24, 15, 34, 22, 14, 31, 5, 21, 23, 16, 20, 2, 18, 19, 32, 27, 13, 25, 30, 6, 29, 17, 11, 35, 8, 12, 9, 10, 26, 28, 4, 3 |
+| HALO (ours) Qwen3-8B | 10, 6, 7, 24, 33, 2, 4, 1, 34, 8, 11, 32, 12, 0, 19, 27, 16, 22, 13, 26, 35, 20, 31, 15, 9, 29, 14, 5, 3, 17, 23, 28, 30, 21, 25, 18 |
+_Table 8. The number of FLOPs and training/inference tokens required by each stage in HALO, applied to Qwen3-1.7B. Layer selection
+stage spends fewer FLOPs per token because it performs only inference and does not require backward passes. Stage 3 has greater FLOPs
+per token because it uses a greater context length. * indicates inference tokens while other entries are training tokens._
+_Table 8 reports the computational cost (in the number of FLOPs) of each stage in HALO, our distillation process. The layer
+selection process requires the model to perform inference on our evaluation tasks. There tasks contain 8.36M tokens in total
+and the FLOPs per token for inference is notably fewer than that of training._
+The Number of Tokens Required by KL-Guided Layer Selection The number of training tokens used for the attention
+selection method, KL-guided layer selection (KL-LS) (Li et al., 2025), depends on the number of layers in model
+Specifically, their method requires 700M x L + 600M tokens, where L is the number of layers in the base model. In the
+main content (Table | and Figure 2), we report the number of tokens used for converting Qwen2.5-3B into RNNs with
+KL-LS. which is the model used in their paper. That model has 36 layers.
+In this section, we compare the runtime of each RNN mixer across different context lengths, measured on one NVIDIA
+A800-80GB GPU. The inference throughput results is shown in Figure 7. “‘time-dep.” means that forget gates (or, memory
+decay multiplier) depend on the current time step, while “time-indep.” means that forget gates are fixed. We find that
+Lightning Attention with data-independent forget gates is significantly faster than other RNN mixers and comparable to
+SWA with a 512 window size, thanks to its highly simple update rule. This result further validate the superiority of Lightning
+Attention on HypeNet.
+E. Computational Cost of Each Stage
+E.1. RNN Mixer Efficiency Measurement
+[TABLE: The table shows computational metrics including tokens processed, FLOPs per token, total FLOPs, and GPU hours for different stages of a process.]
+| Stage | Tokens | FLOPs / token | FLOPs | GPU hours (A800) |
+| --- | --- | --- | --- | --- |
+| Stage 1 | 320M | 4.15B | 2.7e18 | 10.0 |
+| Layer selection | 234M* | 1.38B | 6.5e17 | N/A |
+| Stage 2 | 1B | 4.15B | 8.3e18 | 43.4 |
+| Stage 3 | 1B | 6.88B | 1.4e19 | 37.7 |
+| Total | 2.3B | 16.6B | 2.5e19 | 91.1 |
+
+[PAGE 16]
+
+[CHART (line)]
+  Insight: Flash-Attention-2's time per token increases steeply with context length, while SWA-128 remains the fastest and most consistent.
+  Trends: Flash-Attention-2 shows a steep increase in time per token as context length increases; Lightning Attention, SWA-512, and SWA-2048 have relatively flat time per token across context lengths; Gated Linear Attention and Gated DeltaNet have slightly increasing trends; Mamba2 remains almost constant; SWA-128 remains nearly constant and lowest in time per token
+| Context Length (K) | Lightning Attention (ms) | Gated Linear Attention (ms) | Mamba2 (ms) | Gated DeltaNet (ms) | Flash-Attention-2 (ms) | SWA-128 (ms) | SWA-512 (ms) | SWA-2048 (ms) |
+|-------------------|-------------------------|-----------------------------|-------------|--------------------|-----------------------|--------------|--------------|---------------|
+| 1                 | 7                       | 30                          | 15          | 25                 | 7                     | 3            | 7            | 7             |
+| 2                 | 7                       | 30                          | 15          | 25                 | 15                    | 3            | 7            | 15            |
+| 4                 | 7                       | 30                          | 15          | 25                 | 30                    | 3            | 7            | 20            |
+| 8                 | 7                       | 30                          | 15          | 25                 | 50                    | 3            | 7            | 25            |
+| 16                | 7                       | 30                          | 15          | 25                 | 80                    | 3            | 7            | 30            |
+| 32                | 8                       | 32                          | 15          | 25                 | 110                   | 3            | 7            | 30            |
+| 64                | 9                       | 33                          | 15          | 25                 | 140                   | 3            | 7            | 30            |
+| 128               | 8                       | 35                          | 15          | 25                 | 150                   | 3            | 7            | 30            |
+| 256               | 8                       | 37                          | 15          | 25                 | 150                   | 3            | 7            | 30            |
+_Figure 7. The inference prefilling time of various mixers as a function of context lengths, measured on one A800-80GB GPU using
+BFLoat16. The sliding window mixers are implemented with Flash-Attention-2, Mamba2 is implemented with its official mamba_ssn
+
+library, and all other RNN mixers are taken from the widely used Flash-Linear-Attention®. Mamba2 ran out of CUDA Memory on 256K
+context leneth. The y-axis is on log scale._
+We use the popular evaluation framework, LM-Evaluation-Harness (Gao et al., 2024), for all of our evaluation, and
+the version we use is 0.4.10.dev0. Before evaluation, we export each checkpoint such that it can be loaded with
+
+AutoModelForCausalLM.from_pretrained with the HuggingFace transformers library. Then, we run LM.
+Evaluation-Harness with the HuggingFace API. We use BFloat16 during evaluation.
+Qwen3 YaRN By default, we evaluate Qwen3 models without any modifications to the official model configuration file
+But for long-context tasks that exceed their default maximum context length, which is 40,960 tokens, we apply YaRN
+method as described in the official model card adding a "rope_scaling" entry in the configuration file.
+Downstream Tasks for CSR The downstream tasks for measuring CSR performance are as follows:
+We always use normalized accuracy by default. which more common according to the authors of LM-Evaluation-Harness
+Figure 8 report the results of HypeNet without attention logits scaling in HyPE, which is described in Eq. 11, but is repeated
+here for convenience:
+As one can see from Figure 8, without logits scaling (i.e., setting s, = 1), HyPE exhibits limited length generalization
+abilities. With constant scaling (setting s,; = 1.5 for all positions) improve length generalization to a decent degree. But the
+full potential of HyPE is unlocked with a position-dependent scaling factor, setting s; = log. (t+ a).
+  {formula: $s_t = 1$}
+  [meaning: This formula defines the variable s at time t to be equal to one.]
+  {formula: $s_t = 1.5$}
+  [meaning: This formula defines the variable s at time t to be equal to 1.5.]
+  {formula: $s_t = \log_q (t + a)$}
+  [meaning: This formula defines the value s_t as the logarithm base q of the quantity (t plus a constant a).]
+F.2. More Fvyalnation Details
+e ARC-Easy (Clark et al.. 2018)
+e ARC-Challenve (Clark et al.. 2018)
+e HellaSwag (Zellers et al.. 2019)
+e WinoGrande (Sakasuchi et al.. 2019)
+e PIOA (Bisk et al.. 2019)
+e LAMBADA (Paperno et al.. 2016)
+e MMLU (Hendrvcks et al.. 2021)
+FEF. More Experimental Results
+E.1. Attention Logits Scaling Validation
+$$
+\[ \text{softmax}\left( \frac{s_t \mathbf{q}_t \mathbf{K}}{\sqrt{d_h}} \right), \quad s_t = \log_a (t + a), \]
+$$
+  [definition: This formula defines a scaled softmax attention mechanism where the scaling factor s_t is a logarithmic function of time step t plus a constant a, used to modulate the attention scores before applying softmax.]
+
+[PAGE 17]
+
+_Figure 8. Results for validating attention logits scaling (see Eq. 11). The plot shows the NIAH performance of HypeNet without attentior
+logits scaling, HypeNet with constant scaling (which is common in RoPE-based length extrapolation methods), and HypeNet with the
+attention logits scaling defined in Eq. 11._
+_Table 9. Ablation experiment results for stage 1 and 2 of HALO, applied to Owen3-1.7B_
+[TABLE: The table compares Needle-in-a-Haystack performance metrics across different model sizes and learning rates for two stages of ablation studies.]
+| Model | CSR | 4K | 8K | 16K | 32K | 64K | 128K |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100M tokens (RADLADS) | 55.2 | 91.7 | 89.9 | 80.9 | 87.8 | 84.1 | 79.9 |
+| 320M tokens (ours) | 55.4 | 95.5 | 93.3 | 88.2 | 92.5 | 87.3 | 80.9 |
+| 625M tokens | 55.4 | 95.1 | 94.5 | 90.0 | 92.0 | 86.7 | 75.6 |
+| 1.3B tokens | 55.1 | 90.5 | 89.5 | 81.0 | 91.4 | 83.1 | 61.2 |
+| Max LR = 1e-5 (RADLADS) | 46.9 | 89.2 | 72.7 | 71.2 | 88.1 | 65.1 | 60.7 |
+| Max LR = 3e-5 | 55.5 | 67.0 | 70.1 | 66.4 | 64.5 | 54.2 | 54.9 |
+| Max LR = 1e-4 (ours) | 56.4 | 79.9 | 75.4 | 76.9 | 78.7 | 70.1 | 68.7 |
+| Max LR = 3e-4 | 46.0 | 71.1 | 61.2 | 36.4 | 39.8 | 36.1 | 36.1 |
+| Max LR = 1e-3 | 36.8 | 79.2 | 73.9 | 75.5 | 75.1 | 84.5 | 75.1 |
+_Stage 1 ablations and Stage 2 ablations are separated in the table; RADLADS and 'ours' indicate different methods or configurations._
+Table 9 presents the ablation experiments on the training configurations in our conversion procedure, HALO. For stage
+1, surprisingly, increasing the amount of training data beyond 320M tokens does not result in strong final performance
+For stage 2, we can see that the default constant LR from RADLADS (Goldstein et al., 2025) is highly suboptimal. This
+
+discrepancy might be a result of the fact that RADLADS employs a different network architecture than ours and/or that their
+model sizes are different.
+Here, we describe a more comprehensive (but not exhaustive) list of RNN mixers that are compatible with HypeNet. In
+other words. they can be expressed as Ea. (5) and (6)), which we rewrite here for convenience.
+This formulation includes (but are not limited to) the RNN mixers listed in Table 10. Table 11 describes how the notations
+from each of the mixers studied in this paper correspond to our notations for RNN mixers (i.e., Eq. (21)). It also illustrates
+which components in these RNN mixers inherit the attention weights in HALO.
+Mamba? is derived from the perspective of state space models (SSMs), which is not based on QKV as the input. State
+space models may not always be expressible as Eq (21). Fortunately, Mamba and Mamba? are special cases of SSMs that
+can be expressed as gated linear attention (Yang et al., 2024). The Mamba2 paper (Dao & Gu, 2024) provides an in-depth
+F1.1. HALO CONFIGURATION ABLATION EXPERIMENTS
+G. Which RNN Mixers are Compatible with HvpeNet?
+G.1. HypeNet’s Compatibility with Mamba2
+[CHART (line)]
+  Insight: HypeNet maintains high accuracy across all evaluation context lengths, outperforming Transformer (RoPE) and scaling methods especially at longer contexts.
+  Trends: Transformer (RoPE) accuracy remains near 100% up to 4k context length, then sharply drops to near 0%; HypeNet maintains near 100% accuracy across all context lengths; constant scaling shows a gradual decrease in accuracy after 4k, dropping below 50% at 128k; no scaling shows a steady decline in accuracy after 4k, dropping below 10% at 128k
+| Eval. context Length | Transformer (RoPE) | HypeNet | constant scaling | no scaling |
+|----------------------|-------------------|---------|------------------|------------|
+| 512                  | 100               | 100     | 100              | 100        |
+| 1k                   | 100               | 100     | 100              | 100        |
+| 2k                   | 100               | 100     | 100              | 100        |
+| 4k                   | 95                | 100     | 100              | 100        |
+| 8k                   | 5                 | 100     | 55               | 20         |
+| 16k                  | 0                 | 100     | 20               | 5          |
+| 32k                  | 0                 | 98      | 10               | 2          |
+| 64k                  | 0                 | 98      | 15               | 1          |
+| 128k                 | 0                 | 97      | 45               | 5          |
+| 256k                 | 0                 | 95      | 45               | 5          |
+$$
+\[ \mathbf{q}_t = \mathbf{x}_t \mathbf{W}_q, \quad \mathbf{k}_t = \mathbf{x}_t \mathbf{W}_k, \quad \mathbf{v}_t = \mathbf{x}_t \mathbf{W}_v, \\ \mathbf{S}_t = \mathbf{F}_t \mathbf{S}_{t-1} + \mathbf{k}_t^{\top} \mathbf{v}_t \in \mathbb{R}^{d_h \times d_h}, \\ \mathbf{y}_t = \mathbf{q}_t \mathbf{S}_t \mathbf{W}_o^{\top} \in \mathbb{R}^d, \]
+$$
+  [update_rule: This formula describes the update and computation steps in a recurrent attention mechanism, where input vectors are projected into query, key, and value vectors, the state matrix is updated using a transition matrix and outer product of key and value, and the output is computed by applying the query to the updated state and projecting to output space.]
+
+[PAGE 18]
+
+_Table 10. Non-exhaustive list of representative RNN mixers that are compatible with HypeNet and HALO_
+[TABLE: The table lists pairs of attention methods and their corresponding references from various years.]
+| Method 1 | Method 2 |
+| --- | --- |
+| Linear Attention (Katharopoulos et al., 2020) | RetNet (Sun et al., 2023) |
+| Lightning Attention (Qin et al., 2024a) | HGRN-2 (Qin et al., 2024b) |
+| GLA (Yang et al., 2024) | Mamba2 (Dao & Gu, 2024) |
+| GSA (Zhang et al., 2024) | DeltaNet (Yang et al., 2025c) |
+| GDN (Yang et al., 2025b) | RWKV-7 (Peng et al., 2025) |
+| TTT (Sun et al., 2025) | Kimi DeltaAttention (Kimi et al., 2025) |
+_Table 11. List of how various state-of-the-art RNNs can be expressed as outer-product-based RNNs (i.e., Eq (21)), using the notations
+from their respective original paper. “-” indicates that these variables are never described in their original papers, but they can be found in
+the implementations. Our code for converting each of these RNN mixers is publicly available._
+[TABLE: The table compares different Mixer architectures by listing their corresponding F_t functions and associated variables and weight matrices.]
+| Mixer | F_t | q_t | k_t | v_t | W_q | W_k | W_v | W_o |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Lightning Attention | λ | q_t | k_t | v_t | W_q | W_k | W_v | - |
+| Mamba2 | α_t I | C_t | Δ_t B_t | x_t | - | - | W^(x) | W^(o) |
+| GLA | diag(α_t) | q_t | k_t | v_t | W_Q | W_K | W_V | W_O |
+| GDN | α_t (I - β_t k_t^⊤ k_t) | q_t | k_t | v_t | W_Q | W_K | W_V | - |
+| RWKV-7 | (diag(ω_t) - κ̂_t k_t^⊤ (a_t ⊙ κ̂_t)) | r_t | k̃_t | ν_t | W_r | W_k | W_v | W_o |
+discussion of how (gated) linear attention is related to SSMs. In brief, both of these state-of-the-art SSMs are compatible
+with HvypeNet.
+Multi-Head Mechanism However, from the perspective of linear attention, Mamba2 adopts a multi-value mechanism in
+which all heads share the same set of queries and keys. This is not the usual configuration for softmax attention models
+Therefore, in order to utilize the pre-trained model weights of softmax attention models, we use multi-head Mamba? in this
+paper. This change has a negligible impact on the model’s throughput.
+Here, we discuss a failed attempt at converting Qwen3’s attention into KDA (Kimi et al., 2025), in order to facilitate
+more effctive research. We have tried to use HALO to convert Qwen3’s attention layers into KDA layers using the same
+configurations as described in Appendix B. However, the training process could not converge with the gradient norm
+becoming inf after a few steps in stage 2. We tried reducing the learning rate but it did not help.
+H. Training and Model Configurations for Training From Scratch Experiments
+Here, we describe the training and model configurations for the experiments in Section 6.3.
+_Table 12. Training configurations and hyperparameters used when training from scratch (Section 6.3)._
+G.2. A Note on Kimi Delta Attention
+[TABLE: This table lists the hyperparameters and their values used for training a machine learning model.]
+| Hyperparameter | Value |
+| --- | --- |
+| Total tokens | 20B |
+| Context length | 4096 |
+| Batch size | 128 |
+| Training steps | 40,000 |
+| LR scheduler | WSD (Hu et al., 2024) |
+| Max. Learning rate | 5 × 10⁻⁴ |
+| Min. learning rate | 5 × 10⁻⁵ |
+| LR warmup steps | 1,000 |
+| LR decay steps | 8,000 |
+| Optimizer | AdamW, β = (0.9, 0.95) |
+| Weight decay | 0.1 |
+
+[PAGE 19]
+
+_Table 13. Model architecture configurations for the from-scratch training experiments (Section 6.3). The tokenizer for all models is the
+GPT_2 tokenizer’._
+_aling hyperparameter of various models in the from-: tch training experiments (Section 6.3)_
+All models are trained on 20 billion tokens from the FineWeb-edu dataset (Penedo et al., 2024). We use 8 NVIDIA
+A800 GPUs to train each model. The training code is based on the HuggingFace Accelerate framework. The specific
+
+training hyperparameters are detailed in Table 12. The hyparameters are chosen to best match standard practicing in LLM
+pre-training.
+To ensure fair comparison, the parameter count for all models is controlled at approximately 500M. We also try to keep the
+implementation as similar as possible to its official implementation released by the respective authors. For HypeNet models
+25% of the layers are attention layers, interleaved with RNN layers in a repeating pattern of one attention layer followed by
+three RNN layers (i.e., Attn - RNN —> RNN - RNN)*. The MLP blocks after each attention/RNN block are always a
+SwiGLU block with the same hyperparameters. Table 13 reports the detailed configuration for each model, Table 14 reports
+the attention logits scaling (see Section 5.1) for each model., and Table 15 reports the configurations for each RNN mixer
+The ensure fair comparison with the Transformer model and SWAN-GPT and also to better compare with our HypeNet
+models that are distilled from pre-trained Transformer models, we do not employ short convolutions in RNN mixers.
+  {formula: \[ \text{Attn} \to \text{RNN} \to \text{RNN} \to \text{RNN} \]^8}
+  [meaning: This formula represents a sequence of neural network components where an attention mechanism is followed by three recurrent neural networks, and this entire sequence is repeated 8 times.]
+H.1. Training Configurations
+H.2. Model Confisurations
+[TABLE: The table compares hyperparameters of three models: Transformer, SWAN-GPT, and HypeNet, highlighting differences in architecture components such as RNN layers, attention layers, and SWA layers.]
+| Hyperparameter | Transformer | SWAN-GPT | HypeNet |
+| --- | --- | --- | --- |
+| Tokenizer | GPT-2 | GPT-2 | GPT-2 |
+| Vocabulary size | 50,304 | 50,304 | 50,304 |
+| Layers | 28 | 28 | 28 |
+| Hidden size | 1024 | 1024 | 1024 |
+| RNN layers | 0 | 0 | 21 |
+| Full Attn. layers | 28 | 7 | 7 |
+| SWA layers | 0 | 21 | 0 |
+| SWA Window size | – | 512 | – |
+| FNN width | 3072 | 3072 | 3072 |
+| Head dim | 128 | 128 | 128 |
+| Attention heads | 16 | 16 | 16 |
+| Attention KV heads | 8 | 8 | 8 |
+| RNN heads | – | – | 16 |
+| Tie embeddings | Yes | Yes | Yes |
+| QK Norm in attention | Yes | Yes | Yes |
+| RoPE θ | 50k | 50k | 50k |
+[TABLE: The table lists various models alongside their corresponding logit scaling base values as defined in Equation 11.]
+| Model | Logit scaling base a (Eq. 11) |
+| --- | --- |
+| Transformer | None |
+| HypeNet-Lightning | 300 |
+| HypeNet-Lightning (all NoPE) | 1000 |
+| HypeNet-GDN | 200 |
+| HypeNet-GLA | 500 |
+| HypeNet-RWKV7 | 5000 |
+| HypeNet-Mamba2 | 1000 |
+| SWAN-GPT | 1000 |
+
+[PAGE 20]
+
+_Table 15. Hyperparameters for of the RNN layers in the HypeNet variants of the from-scratch training experiments (Section 6.3). V
+denotes that the feature is enabled. X denotes disabled. and ‘“—’’ means that the hyperparameter is not applicable._
+[TABLE: The table compares hyperparameter settings related to gating, normalization, and low-rank parametrization across different HypeNet model variants.]
+| Hyperparameter | HypeNet-Lightning | HypeNet-GDN | HypeNet-GLA | HypeNet-RWKV7 | HypeNet-Mamba2 |
+| --- | --- | --- | --- | --- | --- |
+| Output gate | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Output norm | ✓ | ✓ | ✓ | ✓ | ✓ |
+| QK norm | ✓ | ✓, L2-norm | ✗ | ✗ | ✗ |
+| QKV activation | ✗ | ✓, SiLU | ✗ | ✗ | ✗ |
+| Short Convolution | ✗ | ✗ | ✗ | ✗ | ✗ |
+| F_t neg. eigenvalue | ✗ | ✓ | ✗ | ✗ | ✗ |
+| Gate low-rank dim. | − | − | 16 | 160 | − |
+| Value low-rank dim. | − | − | − | 96 | − |
+| Decay low-rank dim. | − | − | − | 160 | − |
+| A low-rank dim. | − | − | − | 160 | − |
