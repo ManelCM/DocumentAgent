@@ -150,7 +150,7 @@ def _assign_column(block: DocumentBlock, separators: List[int]) -> int:
     return col
 
 
-def _is_full_width(block: DocumentBlock, page_w: int, threshold: float = 0.60) -> bool:
+def _is_full_width(block: DocumentBlock, page_w: int, threshold: float = 0.50) -> bool:
     """True if the block spans more than threshold of the page width."""
     return (block.bbox.x2 - block.bbox.x1) / max(1, page_w) >= threshold
 
