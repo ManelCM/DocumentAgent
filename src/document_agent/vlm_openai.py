@@ -52,12 +52,18 @@ Return ONLY valid JSON with these keys:
 
 TABLE_PROMPT = """You are analyzing a table cropped from a technical document.
 Return ONLY valid JSON with these keys:
-- title: table title/caption if visible inside the crop
-- headers: list of column header strings (in order)
-- rows: list of row objects where each object maps header → cell value (use null for empty cells)
-- notes: any footnotes or annotations below the table
-- summary: one-sentence description of what the table shows
-- confidence: float 0-1"""
+- title: table title/caption if visible inside the crop (empty string if none)
+- headers: list of column header strings in left-to-right order.
+  For multi-level headers (e.g. a top header spanning sub-columns), flatten them as "Parent / Child".
+  For row-header tables (first column labels rows), include the row-header column name as the first header.
+- rows: list of row objects where each key is a header string and each value is the cell content.
+  Use null for empty/merged cells. For merged cells that span multiple rows, repeat the value in each row.
+  Preserve numeric formatting exactly (units, percentages, scientific notation).
+- row_headers: if the first column contains row labels (not data), list those labels separately here
+  so downstream code can distinguish them from numeric data columns. Otherwise empty list.
+- notes: any footnotes, annotations, or legends below the table (empty string if none)
+- summary: one-sentence description of what the table shows and what its main finding is
+- confidence: float 0-1 reflecting how clearly you could read the table"""
 
 # Map prompt name → prompt text (for traceability)
 PROMPT_REGISTRY: Dict[str, str] = {
@@ -185,6 +191,82 @@ def _run_openai_vision(
     }
     text = _extract_content_text(resp.choices[0].message.content).strip()
     return text, usage, duration_s
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Batch call — sends N images in one request, returns N parsed JSON dicts
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_openai_vision_batch(
+    prompt: str,
+    model: str,
+    imgs: list,
+    api_key: str,
+) -> Tuple[list, Dict, float]:
+    """Send multiple images in a single OpenAI call.
+
+    The model is asked to return ``{"results": [...]}`` with one entry per
+    image in order.  Falls back to an empty list on any failure so callers
+    can retry individually.
+
+    Returns
+    -------
+    results : list[dict]
+        Parsed dicts, one per image.  May be shorter than ``imgs`` on error.
+    usage : dict
+    duration_s : float
+    """
+    from openai import OpenAI
+    import json as _json
+
+    n = len(imgs)
+    t0 = time.time()
+
+    content: list = [
+        {
+            "type": "text",
+            "text": (
+                f"You will receive {n} image(s) numbered 1 to {n}. "
+                f"For EACH image apply the following instructions and return a JSON object "
+                f"with a single key 'results' containing a list of {n} objects in order.\n\n"
+                f"{prompt}"
+            ),
+        }
+    ]
+    for idx, img in enumerate(imgs):
+        content.append({"type": "text", "text": f"Image {idx + 1}:"})
+        content.append({"type": "image_url", "image_url": {"url": _img_to_data_url(img), "detail": "high"}})
+
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "Return concise, valid JSON only. Do not wrap in markdown code fences."},
+                {"role": "user", "content": content},
+            ],
+        )
+        duration_s = time.time() - t0
+        u = resp.usage
+        pt = u.prompt_tokens if u else 0
+        ct = u.completion_tokens if u else 0
+        usage = {
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": pt + ct,
+            "cost_usd": round(estimate_cost_usd(model, pt, ct), 6),
+        }
+        raw = _extract_content_text(resp.choices[0].message.content).strip()
+        parsed = _json.loads(raw)
+        results = parsed.get("results", [])
+        if not isinstance(results, list):
+            results = []
+        return results, usage, duration_s
+    except Exception:
+        duration_s = time.time() - t0
+        return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}, duration_s
 
 
 # ──────────────────────────────────────────────────────────────────────────────
