@@ -63,6 +63,29 @@ def main():
     out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
     log.info("Structured output → %s", out_path)
 
+    # ── Export Markdown ──────────────────────────────────────────────────────
+    try:
+        from .exporters.markdown import export_markdown
+        md_path = out_path.parent / (out_path.stem + ".md")
+        export_markdown(output, md_path)
+        log.info("Markdown → %s", md_path)
+    except Exception as exc:
+        log.warning("Markdown export failed: %s", exc)
+
+    # ── Export Tables (CSV + Excel) ──────────────────────────────────────────
+    try:
+        from .exporters.tables import export_tables, export_tables_excel
+        tables_dir = out_path.parent / "tables"
+        csvs = export_tables(output, tables_dir)
+        if csvs:
+            log.info("Tables → %d CSV(s) in %s", len(csvs), tables_dir)
+        xlsx_path = out_path.parent / (out_path.stem + "_tables.xlsx")
+        xlsx = export_tables_excel(output, xlsx_path)
+        if xlsx:
+            log.info("Tables Excel → %s", xlsx)
+    except Exception as exc:
+        log.warning("Table export failed: %s", exc)
+
     # ── Generate report ──────────────────────────────────────────────────────
     if not args.no_report:
         report_dir = Path(args.report) if args.report else out_path.parent / (out_path.stem + "_report")
