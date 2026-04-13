@@ -23,6 +23,8 @@ def parse_args():
     parser.add_argument("--output",  required=True,  help="Ruta de salida JSON.")
     parser.add_argument("--report",  default=None,   help="Directorio donde generar el informe HTML/PNG. Si se omite se genera junto al output.")
     parser.add_argument("--no-report", action="store_true", help="Desactivar generación de informe.")
+    parser.add_argument("--max-pages", type=int, default=0,
+                        help="Only process the first N pages (0 = all pages).")
     parser.add_argument("--verbose", "-v", action="store_true", help="Logs de nivel DEBUG.")
     return parser.parse_args()
 
@@ -49,7 +51,8 @@ def main():
     app = build_graph().compile()
 
     log.info("Starting OCR pipeline on: %s", args.input)
-    result = app.invoke({"input_path": args.input, "status": "init"})
+    result = app.invoke({"input_path": args.input, "status": "init",
+                         "max_pages": args.max_pages})
     output = result.get("output", {})
     trace  = result.get("_trace", {})
     pages  = result.get("pages", [])
@@ -70,6 +73,16 @@ def main():
             print(f"\nReport: {html}")
         except Exception as exc:
             log.warning("Report generation failed: %s", exc)
+
+    # ── Export to Langfuse (opt-in via LANGFUSE_PUBLIC_KEY env var) ─────────────
+    try:
+        from .langfuse_exporter import export as lf_export
+        run_id = result.get("run_id", "")
+        exported = lf_export(trace, output, args.input, run_id)
+        if exported:
+            log.info("Langfuse trace exported (run_id=%s)", run_id)
+    except Exception as exc:
+        log.debug("Langfuse export skipped: %s", exc)
 
     total = trace.get("total_duration_s")
     n = output.get("summary", {}).get("num_blocks", 0)
