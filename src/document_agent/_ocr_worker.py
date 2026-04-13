@@ -30,7 +30,11 @@ def _run_ocr(crop):
     # Lazy singleton — one per worker process
     global _OCR
     if "_OCR" not in globals():
-        _OCR = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+        # PaddleOCR v3 removed show_log; use_angle_cls deprecated → use_textline_orientation
+        try:
+            _OCR = PaddleOCR(use_textline_orientation=False, lang="en")
+        except TypeError:
+            _OCR = PaddleOCR(use_angle_cls=False, lang="en")  # v2 fallback
     result = _OCR.ocr(crop, cls=False)
     lines, confs = [], []
     if result:
