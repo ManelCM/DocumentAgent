@@ -35,17 +35,31 @@ def _run_ocr(crop):
             _OCR = PaddleOCR(use_textline_orientation=False, lang="en")
         except TypeError:
             _OCR = PaddleOCR(use_angle_cls=False, lang="en")  # v2 fallback
-    result = _OCR.ocr(crop, cls=False)
+    try:
+        result = list(_OCR.predict(crop))  # v3 API
+    except AttributeError:
+        result = _OCR.ocr(crop, cls=False)  # v2 fallback
     lines, confs = [], []
     if result:
-        for page in result:
-            if not page:
-                continue
-            for line in page:
-                if line and len(line) >= 2 and line[1]:
-                    txt, conf = line[1][0], line[1][1]
-                    lines.append(str(txt))
-                    confs.append(float(conf))
+        for item in result:
+            # v3: OCRResult objects with rec_text / rec_score attributes
+            if hasattr(item, "rec_text"):
+                lines.append(str(item.rec_text))
+                confs.append(float(getattr(item, "rec_score", 1.0)))
+            elif hasattr(item, "text"):
+                lines.append(str(item.text))
+                confs.append(float(getattr(item, "score", 1.0)))
+            elif isinstance(item, (list, tuple)):
+                # v2: [[box], [text, conf]] or page wrapper
+                page_items = item if isinstance(item[0], (list, tuple)) else [item]
+                for line in page_items:
+                    if line and len(line) >= 2 and line[1]:
+                        try:
+                            txt, conf = line[1][0], line[1][1]
+                            lines.append(str(txt))
+                            confs.append(float(conf))
+                        except (IndexError, TypeError):
+                            pass
     text = " ".join(lines).strip()
     avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
     return text, avg_conf

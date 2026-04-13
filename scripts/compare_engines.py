@@ -268,17 +268,19 @@ def run_docling(pdf_path: Path, max_pages: int) -> Tuple[str, float]:
     t0 = time.perf_counter()
     try:
         converter = DocumentConverter()
-        result = converter.convert(str(pdf_path))
-        # Export to markdown and strip formatting
-        md = result.document.export_to_markdown()
-        text = re.sub(r"#{1,6}\s+", "", md)
-        text = re.sub(r"\*\*|__|\*|_", "", text)
-        # Apply max_pages by word-count approximation (Docling processes all pages)
+        kwargs: Dict = {"raises_on_error": False}
         if max_pages > 0:
-            # Rough truncation — Docling doesn't expose per-page control easily
-            words = text.split()
-            # avg ~500 words/page
-            text = " ".join(words[:max_pages * 500])
+            kwargs["max_num_pages"] = max_pages
+        result = converter.convert(str(pdf_path), **kwargs)
+        # Export to plain text (no markdown formatting to strip)
+        if hasattr(result.document, "export_to_text"):
+            text = result.document.export_to_text()
+        else:
+            md = result.document.export_to_markdown()
+            text = re.sub(r"#{1,6}\s+", "", md)
+            text = re.sub(r"\*\*|__|\*|_", "", text)
+            text = re.sub(r"\$\$.*?\$\$", " ", text, flags=re.DOTALL)
+            text = re.sub(r"\$[^$]+\$", " ", text)
     except Exception as exc:
         return f"[docling error: {exc}]", 0.0
     elapsed = time.perf_counter() - t0
@@ -468,6 +470,7 @@ def main():
     parser.add_argument("--max-pages",   type=int, default=5,          help="Pages per doc (0=all)")
     parser.add_argument("--engines",     default="all",               help="Comma-separated engine list or 'all'")
     parser.add_argument("--append",      action="store_true",          help="Append to existing results.csv instead of overwriting")
+    parser.add_argument("--filter-docs", default="",                   help="Comma-separated doc stems to process (default: all)")
     parser.add_argument("--skip-docagent", action="store_true",        help="Skip re-running DocumentAgent if output exists")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
@@ -497,10 +500,16 @@ def main():
             sys.exit(1)
 
     # Find PDFs
-    pdf_files = sorted(docs_dir.glob("*.pdf"))
-    if not pdf_files:
+    all_pdfs = sorted(docs_dir.glob("*.pdf"))
+    if not all_pdfs:
         log.error("No PDFs found in %s", docs_dir)
         sys.exit(1)
+    if args.filter_docs:
+        filter_set = {s.strip() for s in args.filter_docs.split(",")}
+        pdf_files = [p for p in all_pdfs if p.stem in filter_set]
+        log.info("Filtered to %d docs: %s", len(pdf_files), [p.stem for p in pdf_files])
+    else:
+        pdf_files = all_pdfs
 
     log.info("Documents: %d | Engines: %s | Max pages: %s",
              len(pdf_files), selected, args.max_pages or "all")
