@@ -76,7 +76,17 @@ _LAYOUT_DETECTOR_LOCK = threading.Lock()
 
 
 def get_layout_detector(warnings: List[str]):
-    """Return the shared LayoutDetection instance, initialising it once."""
+    """Return the shared LayoutDetection instance, initialising it once.
+
+    Model selection (env var DOCAGENT_LAYOUT_MODEL):
+      PP-DocLayout_plus-L  — highest accuracy, ~4.3s/page  (default for quality)
+      PP-DocLayout-L       — slightly faster,  ~3.4s/page
+      PP-DocLayout-M       — balanced
+      PP-DocLayout-S       — fastest, lower accuracy
+
+    enable_mkldnn is always False: PaddlePaddle 3.x oneDNN raises
+    NotImplementedError on some ops when PIR mode is active on Windows.
+    """
     global _LAYOUT_DETECTOR, _LAYOUT_DETECTOR_LOADED
     if _LAYOUT_DETECTOR_LOADED:
         return _LAYOUT_DETECTOR
@@ -85,11 +95,13 @@ def get_layout_detector(warnings: List[str]):
             return _LAYOUT_DETECTOR
         _LAYOUT_DETECTOR_LOADED = True
         try:
+            import os
             from paddleocr import LayoutDetection
-            # enable_mkldnn=False: PaddlePaddle 3.x oneDNN backend raises
-            # NotImplementedError on some operators when PIR mode is active.
-            # Disabling oneDNN forces the plain CPU path, which is stable.
-            _LAYOUT_DETECTOR = LayoutDetection(enable_mkldnn=False)
+            model_name = os.getenv("DOCAGENT_LAYOUT_MODEL", "PP-DocLayout_plus-L")
+            _LAYOUT_DETECTOR = LayoutDetection(
+                model_name=model_name,
+                enable_mkldnn=False,
+            )
         except Exception as exc:
             warnings.append(
                 f"LayoutDetection unavailable. Using page-level fallback. Details: {exc}"
