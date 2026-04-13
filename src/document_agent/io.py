@@ -27,10 +27,17 @@ def _pixmap_to_bgr(pix: pymupdf.Pixmap) -> np.ndarray:
         raise ValueError(f"Unsupported number of channels: {pix.n}")
 
 
-def load_document_pages(input_path: str, dpi: int = 200) -> Tuple[List[np.ndarray], List[Dict[str, int]]]:
-    """ 
-    Load pages from a document file. Supports PDFs (rendered to images) and image files. Returns a list of page images as numpy arrays and their sizes.
+def load_document_pages(
+    input_path: str,
+    dpi: int = 200,
+    max_pages: int = 0,
+) -> Tuple[List[np.ndarray], List[Dict[str, int]]]:
+    """
+    Load pages from a document file. Supports PDFs (rendered to images) and image files.
+    Returns a list of page images as numpy arrays and their sizes.
     Each size dict contains: {"page_index": int, "width": int, "height": int}.
+
+    max_pages: if > 0, only the first N pages are loaded (useful for benchmarking).
     """
     path = Path(input_path)
     if not path.exists():
@@ -42,13 +49,15 @@ def load_document_pages(input_path: str, dpi: int = 200) -> Tuple[List[np.ndarra
     if path.suffix.lower() == ".pdf":
         doc = pymupdf.open(path)
         try:
-            zoom = dpi / 72.0 # 72 DPI is the default resolution of PDF points. Resolution scaled for pdf rendering.    
+            zoom = dpi / 72.0 # 72 DPI is the default resolution of PDF points. Resolution scaled for pdf rendering.
             matrix = pymupdf.Matrix(zoom, zoom)
-            for i, page in enumerate(doc): 
+            for i, page in enumerate(doc):
+                if max_pages > 0 and i >= max_pages:
+                    break
                 pix = page.get_pixmap(matrix=matrix, alpha=False) # Render page to image at specified DPI, without alpha channel (take a photo from the page)
                 img = _pixmap_to_bgr(pix) # Convert to BGR format for OpenCV compatibility
                 pages.append(img)   # Add to the list
-                sizes.append({"page_index": i, "width": int(img.shape[1]), "height": int(img.shape[0])}) # Store page size info 
+                sizes.append({"page_index": i, "width": int(img.shape[1]), "height": int(img.shape[0])}) # Store page size info
         finally:
             doc.close()
     else:

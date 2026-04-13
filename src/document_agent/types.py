@@ -89,6 +89,7 @@ class DocumentBlock:
 
 class AgentState(TypedDict, total=False):
     input_path: str
+    max_pages: int   # 0 = no limit; clips PDF loading at N pages
     run_id: str
     pages: List[Any]
     page_sizes: List[Dict[str, int]]
