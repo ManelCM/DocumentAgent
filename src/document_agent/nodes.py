@@ -39,7 +39,7 @@ def node_load_document(state: AgentState) -> AgentState:
     run_id = state.get("run_id") or str(uuid.uuid4())
     warnings = list(state.get("warnings", []))
     logger.info("[load_document] loading %s", state["input_path"])
-    pages, sizes = load_document_pages(state["input_path"])
+    pages, sizes = load_document_pages(state["input_path"], max_pages=state.get("max_pages", 0))
 
     node_end(entry)
     logger.info("[load_document] %d pages loaded in %.2fs", len(pages), entry["duration_s"])
@@ -194,75 +194,135 @@ def _crop_block_image(state: AgentState, block_id: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PaddleOCR text extraction (replaces Tesseract)
+# OCR — subprocess-isolated PaddleOCR (primary) + pytesseract (fallback)
+#
+# PaddleOCR PP-OCRv5 and LayoutDetection share PaddlePaddle's oneDNN/TBB
+# backend.  Loading both in the same process crashes on Windows.  Running
+# the OCR worker in a subprocess keeps them fully isolated.
+#
+# Set DOCAGENT_PADDLE_OCR=true to enable the subprocess path.
+# Default is false — pytesseract is used directly (fast, reliable for clean PDFs).
 # ──────────────────────────────────────────────────────────────────────────────
 
 import threading as _threading
 
-_PADDLE_OCR = None
-_PADDLE_OCR_LOADED = False
-_PADDLE_OCR_LOCK = _threading.Lock()
+_OCR_SUBPROCESS_LOCK = _threading.Lock()
+_OCR_WORKER_PATH: str = os.path.join(os.path.dirname(__file__), "_ocr_worker.py")
 
 
-def _get_paddle_ocr():
-    """PaddleOCR v3 PP-OCRv5 server models conflict with LayoutDetection in-process
-    on Windows (PaddlePaddle oneDNN/TBB backend crashes with SIGSEGV when both sets
-    of models are loaded in the same process).  Text blocks use pytesseract instead,
-    which gives excellent quality for clean academic/document text.
+def _paddle_ocr_subprocess(crops_with_ids: List[Dict]) -> Dict[str, Dict]:
+    """Run PaddleOCR on a list of {block_id, crop} dicts via subprocess.
+
+    Returns {block_id: {"text": str, "ocr_confidence": float, "ocr_engine": "paddleocr"}}
+    Falls back to empty dict on any subprocess failure (caller uses pytesseract).
     """
-    global _PADDLE_OCR, _PADDLE_OCR_LOADED
-    if _PADDLE_OCR_LOADED:
-        return _PADDLE_OCR
-    with _PADDLE_OCR_LOCK:
-        if _PADDLE_OCR_LOADED:
-            return _PADDLE_OCR
-        _PADDLE_OCR_LOADED = True
-        _PADDLE_OCR = None  # Always use pytesseract fallback
-    return _PADDLE_OCR
+    import pickle, subprocess, tempfile, json as _json, sys as _sys
 
-
-def _extract_text_paddle(crop) -> Dict:
-    """Use PaddleOCR for text recognition. Falls back to Tesseract if unavailable."""
-    if crop is None or not crop.size:
-        return {"text": "", "ocr_engine": "paddleocr"}
-
-    ocr = _get_paddle_ocr()
-    if ocr is not None:
+    results: Dict[str, Dict] = {}
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+        pkl_path = f.name
+        pickle.dump(crops_with_ids, f)
+    try:
+        proc = subprocess.run(
+            [_sys.executable, _OCR_WORKER_PATH, pkl_path],
+            capture_output=True, timeout=120,
+        )
+        if proc.returncode == 0:
+            data = _json.loads(proc.stdout)
+            for r in data.get("results", []):
+                bid = r.get("block_id", "")
+                results[bid] = {
+                    "text": r.get("text", ""),
+                    "ocr_confidence": r.get("confidence", 0.0),
+                    "ocr_engine": "paddleocr",
+                }
+    except Exception:
+        pass
+    finally:
         try:
-            result = ocr.predict(crop)
-            lines = []
-            if result:
-                for page_result in result:
-                    # PaddleOCR v3 returns a list of dicts with 'rec_texts' key
-                    if isinstance(page_result, dict) and "rec_texts" in page_result:
-                        lines.extend(page_result["rec_texts"])
-                    elif hasattr(page_result, "rec_texts"):
-                        lines.extend(page_result.rec_texts)
-                    elif isinstance(page_result, list):
-                        # Old PaddleOCR v2 format: [[bbox, (text, score)], ...]
-                        for line in page_result:
-                            if line and len(line) >= 2 and line[1]:
-                                lines.append(line[1][0])
-            return {"text": " ".join(lines).strip(), "ocr_engine": "paddleocr"}
+            os.unlink(pkl_path)
         except Exception:
-            pass  # fall through to Tesseract
+            pass
+    return results
 
-    # Tesseract (primary text engine — PaddleOCR intentionally disabled)
+
+_EASYOCR_READER = None
+_EASYOCR_LOCK = _threading.Lock()
+
+
+def _get_easyocr():
+    """Lazy-load EasyOCR reader (English). Thread-safe singleton."""
+    global _EASYOCR_READER
+    if _EASYOCR_READER is not None:
+        return _EASYOCR_READER
+    with _EASYOCR_LOCK:
+        if _EASYOCR_READER is not None:
+            return _EASYOCR_READER
+        try:
+            import easyocr
+            langs = os.getenv("DOCAGENT_EASYOCR_LANGS", "en").split(",")
+            _EASYOCR_READER = easyocr.Reader(langs, verbose=False)
+        except Exception:
+            _EASYOCR_READER = None
+    return _EASYOCR_READER
+
+
+def _extract_text_easyocr(crop) -> Dict:
+    """EasyOCR-based text extraction with confidence scores."""
+    reader = _get_easyocr()
+    if reader is None:
+        return {"text": "", "ocr_engine": "easyocr_unavailable"}
+    try:
+        results = reader.readtext(crop, detail=1)
+        min_conf = float(os.getenv("DOCAGENT_EASYOCR_MIN_CONF", "0.3"))
+        parts, confs = [], []
+        for (_bbox, text, conf) in results:
+            confs.append(conf)
+            if conf >= min_conf:
+                parts.append(text)
+        avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
+        return {"text": " ".join(parts).strip(), "ocr_engine": "easyocr",
+                "ocr_confidence": avg_conf}
+    except Exception as exc:
+        return {"text": "", "ocr_engine": "easyocr", "ocr_error": str(exc)}
+
+
+def _extract_text_tesseract(crop) -> Dict:
+    """pytesseract OCR with per-word confidence filtering."""
     try:
         import pytesseract
-        # Use image_to_data to get per-word confidence scores.
-        # Words with confidence < threshold are dropped (catches OCR noise).
         min_conf = int(os.getenv("DOCAGENT_TESSERACT_MIN_CONF", "30"))
         data = pytesseract.image_to_data(crop, output_type=pytesseract.Output.DICT)
         words, confs = data["text"], data["conf"]
-        kept = [w for w, c in zip(words, confs) if str(c).lstrip("-").isdigit() and int(c) >= min_conf and w.strip()]
+        kept = [w for w, c in zip(words, confs)
+                if str(c).lstrip("-").isdigit() and int(c) >= min_conf and w.strip()]
         text = " ".join(kept)
-        # Compute average confidence over all detected words (not just kept ones)
         valid_confs = [int(c) for c in confs if str(c).lstrip("-").isdigit() and int(c) >= 0]
         avg_conf = round(sum(valid_confs) / len(valid_confs) / 100.0, 3) if valid_confs else 0.0
         return {"text": text.strip(), "ocr_engine": "pytesseract", "ocr_confidence": avg_conf}
     except Exception as exc:
-        return {"text": "", "ocr_engine": "fallback", "ocr_error": str(exc)}
+        # Last resort: EasyOCR
+        return _extract_text_easyocr(crop)
+
+
+def _extract_text_paddle(crop) -> Dict:
+    """Single-block OCR entry point.
+
+    Engine priority (controlled by DOCAGENT_OCR_ENGINE env var):
+      pytesseract  (default) — fast, reliable for clean PDFs
+      easyocr                — better on degraded/scanned text, no C++ deps
+      paddleocr              — best accuracy, but requires subprocess isolation
+                               (set DOCAGENT_PADDLE_OCR=true for batch path)
+
+    For PaddleOCR batch subprocess, see _run_specialist_kind.
+    """
+    if crop is None or not crop.size:
+        return {"text": "", "ocr_engine": "pytesseract", "ocr_confidence": 0.0}
+
+    engine = os.getenv("DOCAGENT_OCR_ENGINE", "pytesseract").lower()
+    if engine == "easyocr":
+        return _extract_text_easyocr(crop)
+    return _extract_text_tesseract(crop)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -418,6 +478,7 @@ def _process_block_task(task: Dict) -> Dict:
                     "title":        parsed.get("title", ""),
                     "headers":      parsed.get("headers", []),
                     "rows":         parsed.get("rows", []),
+                    "row_headers":  parsed.get("row_headers", []),
                     "notes":        parsed.get("notes", ""),
                     "summary":      parsed.get("summary", ""),
                     "confidence":   parsed.get("confidence", 0.0),
@@ -469,6 +530,28 @@ _KIND_TO_TYPES: Dict[str, set] = {
     "other": {BlockType.CAPTION, BlockType.HEADER, BlockType.FOOTER, BlockType.OTHER},
 }
 
+# Kinds that can be batched into a single OpenAI multi-image call
+_VLM_KINDS = {"formula", "image", "chart", "table", "mixed"}
+
+# Prompt name per kind (must match PROMPT_REGISTRY keys in vlm_openai.py)
+_KIND_PROMPT_NAME: Dict[str, str] = {
+    "formula": "FORMULA_PROMPT",
+    "image":   "IMAGE_PROMPT",
+    "chart":   "CHART_PROMPT",
+    "table":   "TABLE_PROMPT",
+    "mixed":   "MIXED_PROMPT",
+}
+
+# Safe default payload if a batch result is missing / unparseable
+_KIND_DEFAULTS: Dict[str, Dict] = {
+    "formula": {"latex": "", "symbols": [], "formula_type": "", "meaning": "", "confidence": 0.0},
+    "image":   {"summary": "", "key_elements": [], "visible_text": "", "spatial_layout": "", "confidence": 0.0},
+    "chart":   {"chart_type": "", "title": "", "axes": {}, "series": [], "trends": "",
+                "extrema": "", "comparisons": "", "data_table": "", "takeaway": "", "confidence": 0.0},
+    "table":   {"title": "", "headers": [], "rows": [], "row_headers": [], "notes": "", "summary": "", "confidence": 0.0},
+    "mixed":   {"full_text": "", "formula_latex": "", "plain_text": "", "confidence": 0.0},
+}
+
 
 def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]:
     blocks = state.get("blocks", [])
@@ -489,16 +572,102 @@ def _run_specialist_kind(state: AgentState, kind: str) -> Tuple[Dict, List[str]]
     if not tasks:
         return {}, []
 
-    # Per-kind worker override, e.g. DOCAGENT_FORMULA_MAX_WORKERS=16
-    kind_env = f"DOCAGENT_{kind.upper()}_MAX_WORKERS"
-    global_default = int(os.getenv("DOCAGENT_MAX_WORKERS", "8"))
-    desired = int(os.getenv(kind_env, str(global_default)))
-    max_workers = max(1, min(desired, len(tasks)))
     updates: Dict[str, Dict] = {}
     warnings: List[str] = []
 
+    # ── VLM batch path ────────────────────────────────────────────────────────
+    # Disabled by default: multi-image batches inflate completion tokens 3-4×
+    # (the model returns N full JSON objects per call) with no cost saving vs.
+    # parallel individual calls.  Enable with DOCAGENT_VLM_BATCH=true only if
+    # you need to reduce API request count (e.g. rate-limit headroom).
+    pending_tasks = list(tasks)  # tasks still needing individual processing
+
+    if (kind in _VLM_KINDS and cfg.api_key
+            and os.getenv("DOCAGENT_VLM_BATCH", "false").lower() in {"1", "true", "yes"}):
+        from .vlm_openai import _run_openai_vision_batch
+
+        batch_size = int(os.getenv("DOCAGENT_BATCH_SIZE", "4"))
+        prompt_name = _KIND_PROMPT_NAME[kind]
+        prompt_text = PROMPT_REGISTRY[prompt_name]
+        model = getattr(cfg, f"{kind}_model", "gpt-4.1-mini")
+        defaults = _KIND_DEFAULTS.get(kind, {})
+
+        batches = [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
+
+        def _run_one_batch(batch):
+            crops = [t["crop"] for t in batch]
+            results, usage, dur = _run_openai_vision_batch(prompt_text, model, crops, cfg.api_key)
+            return batch, results, usage, dur
+
+        batch_done_ids: set = set()
+        batch_workers = max(1, min(int(os.getenv("DOCAGENT_MAX_WORKERS", "8")), len(batches)))
+        with ThreadPoolExecutor(max_workers=batch_workers) as ex:
+            batch_futures = [ex.submit(_run_one_batch, b) for b in batches]
+            for fut in as_completed(batch_futures):
+                batch, results, usage, dur = fut.result()
+                if len(results) == len(batch):
+                    # Success — apply results
+                    for task, res in zip(batch, results):
+                        if not isinstance(res, dict):
+                            continue
+                        block = task["block"]
+                        bid = block.block_id
+                        payload = {**defaults, **res,
+                                   "vlm_engine": "openai", "vlm_model": model,
+                                   "batch": True}
+                        updates[bid] = payload
+                        batch_done_ids.add(bid)
+                        record_block(trace, block, specialist=kind,
+                                     engine="openai", duration_s=dur / len(batch),
+                                     payload=payload)
+                        record_llm_call(trace, block_id=bid,
+                                        page_index=block.page_index,
+                                        block_type=block.block_type.value,
+                                        specialist=kind, model=model,
+                                        prompt_name=prompt_name,
+                                        prompt_text=prompt_text,
+                                        response_text="",
+                                        usage=usage,
+                                        duration_s=dur / len(batch))
+                else:
+                    warnings.append(
+                        f"[{kind}] batch of {len(batch)} returned {len(results)} results — retrying individually"
+                    )
+
+        pending_tasks = [t for t in tasks if t["block"].block_id not in batch_done_ids]
+
+    # ── PaddleOCR subprocess batch (text kind only, opt-in) ──────────────────
+    # When DOCAGENT_PADDLE_OCR=true, send ALL text crops to the OCR worker
+    # subprocess in one call so LayoutDetection and PaddleOCR stay isolated.
+    # Blocks that get a result here are removed from pending_tasks.
+    if kind == "text" and os.getenv("DOCAGENT_PADDLE_OCR", "false").lower() in {"1", "true", "yes"}:
+        ocr_inputs = [
+            {"block_id": t["block"].block_id, "crop": t["crop"]}
+            for t in pending_tasks
+        ]
+        if ocr_inputs:
+            ocr_results = _paddle_ocr_subprocess(ocr_inputs)
+            if ocr_results:
+                paddle_done: set = set()
+                for t in pending_tasks:
+                    bid = t["block"].block_id
+                    if bid in ocr_results:
+                        updates[bid] = ocr_results[bid]
+                        paddle_done.add(bid)
+                        record_block(trace, t["block"], specialist="text",
+                                     engine="paddleocr", duration_s=0.0,
+                                     payload=ocr_results[bid])
+                pending_tasks = [t for t in pending_tasks
+                                 if t["block"].block_id not in paddle_done]
+
+    # ── Individual-call fallback (OCR kinds + failed batches) ─────────────────
+    kind_env = f"DOCAGENT_{kind.upper()}_MAX_WORKERS"
+    global_default = int(os.getenv("DOCAGENT_MAX_WORKERS", "8"))
+    desired = int(os.getenv(kind_env, str(global_default)))
+    max_workers = max(1, min(desired, len(pending_tasks))) if pending_tasks else 1
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_process_block_task, t) for t in tasks]
+        futures = [ex.submit(_process_block_task, t) for t in pending_tasks]
         for fut in as_completed(futures):
             result = fut.result()
             bid = result["block_id"]
