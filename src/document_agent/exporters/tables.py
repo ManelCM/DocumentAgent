@@ -31,6 +31,24 @@ def _safe_filename(text: str, max_len: int = 40) -> str:
     return slug[:max_len] if slug else "table"
 
 
+_ILLEGAL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+def _clean_cell(value: str) -> str:
+    """Strip characters openpyxl/Excel rejects in cell values."""
+    return _ILLEGAL_CHARS.sub("", value)
+
+
+def _safe_sheet_name(text: str, idx: int) -> str:
+    """Excel sheet names: max 31 chars, no [ ] : * ? / \\ characters."""
+    # Remove chars forbidden in Excel sheet names
+    clean = re.sub(r"[\[\]:*?/\\]", "", text)
+    # Collapse spaces/underscores
+    clean = re.sub(r"[\s_]+", "_", clean).strip("_")
+    # Truncate to 31 chars
+    clean = clean[:31]
+    return clean if clean else f"Table_{idx + 1}"
+
+
 def _table_rows(block: Dict) -> Tuple[List[str], List[Dict]]:
     """Extract (headers, rows) from a TABLE block payload."""
     p = block.get("payload", {})
@@ -89,9 +107,9 @@ def export_tables(
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if include_metadata:
-                title   = (p.get("title")   or "").strip()
-                summary = (p.get("summary") or "").strip()
-                notes   = (p.get("notes")   or "").strip()
+                title   = _ILLEGAL_CHARS.sub("", (p.get("title")   or "").strip())
+                summary = _ILLEGAL_CHARS.sub("", (p.get("summary") or "").strip())
+                notes   = _ILLEGAL_CHARS.sub("", (p.get("notes")   or "").strip())
                 if title:
                     writer.writerow([f"# {title}"])
                 if summary:
@@ -146,9 +164,9 @@ def export_tables_excel(
         if not headers:
             continue
 
-        name      = _table_name(block, idx)[:31]  # Excel sheet name max 31 chars
+        name      = _table_name(block, idx)
         page      = block.get("page_index", 0) + 1
-        sheet_name = f"p{page}_{name}"[:31]
+        sheet_name = _safe_sheet_name(f"p{page}_{name}", idx)
         ws = wb.create_sheet(title=sheet_name)
 
         p = block.get("payload", {})
@@ -157,7 +175,7 @@ def export_tables_excel(
         for meta_key in ("title", "summary"):
             val = (p.get(meta_key) or "").strip()
             if val:
-                ws.cell(row=row_offset, column=1, value=val).font = Font(italic=True)
+                ws.cell(row=row_offset, column=1, value=_clean_cell(val)).font = Font(italic=True)
                 ws.merge_cells(
                     start_row=row_offset, start_column=1,
                     end_row=row_offset,   end_column=max(1, len(headers)),
@@ -168,7 +186,7 @@ def export_tables_excel(
 
         # Header row
         for col, h in enumerate(headers, start=1):
-            cell = ws.cell(row=row_offset, column=col, value=h)
+            cell = ws.cell(row=row_offset, column=col, value=_clean_cell(str(h)))
             cell.font  = header_font
             cell.fill  = header_fill
             cell.alignment = header_align
@@ -178,7 +196,7 @@ def export_tables_excel(
             row_offset += 1
             for col, h in enumerate(headers, start=1):
                 v = row.get(h)
-                ws.cell(row=row_offset, column=col, value="" if v is None else str(v))
+                ws.cell(row=row_offset, column=col, value="" if v is None else _clean_cell(str(v)))
 
         # Auto-size columns (approximate)
         for col_idx, h in enumerate(headers, start=1):

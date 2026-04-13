@@ -240,8 +240,9 @@ def to_markdown(
                     if b.get("parent_id") and b.get("type") != "mixed"}
 
     lines: List[str] = []
-    # Document title from metadata
-    input_name = Path(output.get("input_path", "document")).stem
+    # Document title from metadata — strip temp prefixes like docagent_<uuid>_
+    raw_name = Path(output.get("input_path", "document")).stem
+    input_name = re.sub(r"^docagent_[0-9a-f\-]{36}_", "", raw_name)
     lines.append(f"# {input_name}\n")
 
     current_page = -1

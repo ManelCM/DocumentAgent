@@ -118,8 +118,12 @@ def _run_pipeline(job_id: str, pdf_path: str, max_pages: int) -> None:
 
         # Markdown
         tmp_dir   = Path(pdf_path).parent
+        # Patch input_path so markdown title uses original filename
+        output_for_md = {**output, "input_path": pdf_path.replace(
+            f"docagent_{job_id}_", ""
+        )}
         md_path   = tmp_dir / f"{job_id}.md"
-        md_path.write_text(to_markdown(output), encoding="utf-8")
+        md_path.write_text(to_markdown(output_for_md), encoding="utf-8")
 
         # Tables
         tables_dir = tmp_dir / f"{job_id}_tables"
